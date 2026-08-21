@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OBB 检测工具 — 旋转框 + 角度</title>
+<style>
+  :root {
+    --bg: #0f1419;
+    --panel: #1a222c;
+    --border: #2d3a48;
+    --text: #e6edf3;
+    --muted: #8b98a5;
+    --accent: #2ecc71;
+    --warn: #f1c40f;
+    --red: #e74c3c;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 24px 16px 48px;
+  }
+  h1 {
+    font-size: 22px;
+    font-weight: 600;
+    margin-bottom: 4px;
+    letter-spacing: 0.5px;
+  }
+  .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+
+  /* 模式切换 */
+  .mode-bar {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 16px;
+    width: min(720px, 92vw);
+  }
+  .mode-btn {
+    flex: 1;
+    padding: 10px 0;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--panel);
+    color: var(--text);
+    font-size: 14px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+  }
+  .mode-btn.active { border-color: var(--accent); background: #1e2a36; color: var(--accent); }
+  .mode-btn:hover { border-color: var(--accent); }
+
+  /* 拖放区 */
+  .dropzone {
+    width: min(720px, 92vw);
+    height: 240px;
+    border: 2px dashed var(--border);
+    border-radius: 14px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    background: var(--panel);
+    user-select: none;
+  }
+  .dropzone:hover, .dropzone.dragover {
+    border-color: var(--accent);
+    background: #1e2a36;
+  }
+  .dropzone .icon { font-size: 40px; }
+  .dropzone .text { font-size: 15px; }
+  .dropzone .hint { font-size: 12px; color: var(--muted); }
+  .dropzone input[type="file"] { display: none; }
+
+  /* 结果区 */
+  .result { display: none; margin-top: 24px; width: min(720px, 92vw); }
+  .result.show { display: block; animation: fadeIn 0.3s ease; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; } }
+
+  .image-wrap {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    overflow: hidden;
+  }
+  .image-wrap img { width: 100%; display: block; }
+
+  .meta {
+    margin-top: 14px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 16px 18px;
+  }
+  .meta h2 { font-size: 14px; color: var(--muted); font-weight: 500; margin-bottom: 12px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+  .card {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 12px;
+  }
+  .card .label { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+  .card .value { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .card .value.angle { color: var(--accent); }
+  .card .value.conf { color: var(--warn); }
+
+  .hint-box {
+    margin-top: 12px;
+    padding: 10px 14px;
+    background: rgba(46, 204, 113, 0.08);
+    border: 1px solid rgba(46, 204, 113, 0.3);
+    border-radius: 10px;
+    font-size: 13px;
+    color: var(--accent);
+  }
+  .error-box {
+    margin-top: 14px;
+    padding: 10px 14px;
+    background: rgba(231, 76, 60, 0.08);
+    border: 1px solid rgba(231, 76, 60, 0.3);
+    border-radius: 10px;
+    font-size: 13px;
+    color: var(--red);
+    display: none;
+  }
+
+  /* 加载中 */
+  .loading { display: none; margin-top: 16px; font-size: 13px; color: var(--muted); }
+  .loading.show { display: flex; align-items: center; gap: 10px; }
+  .spinner {
+    width: 18px; height: 18px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* 摄像头模式 */
+  .cam-panel { display: none; margin-top: 24px; width: min(720px, 92vw); }
+  .cam-panel .image-wrap { background: #000; }
+  .cam-status {
+    margin-top: 10px;
+    font-size: 13px;
+    color: var(--muted);
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+
+<h1>OBB 旋转框检测</h1>
+<div class="subtitle">上传图片 → 自动检测木块位置与角度 → 机械臂对齐 J5 = θ − J1</div>
+
+<div class="mode-bar">
+  <button class="mode-btn active" id="btnImg">📷 图片检测</button>
+  <button class="mode-btn" id="btnCam">🎥 摄像头实时</button>
+</div>
+
+<div class="dropzone" id="dropzone">
+  <div class="icon">🖼️</div>
+  <div class="text">拖拽图片到这里，或点击选择</div>
+  <div class="hint">支持 JPG / PNG</div>
+  <input type="file" id="fileInput" accept="image/*">
+</div>
+
+<div class="cam-panel" id="camPanel" style="display:none">
+  <div class="image-wrap"><img id="camStream" src="/video_feed" alt="摄像头实时检测"></div>
+  <div class="cam-status" id="camStatus">正在连接摄像头…（无画面时请检查 USB 连接）</div>
+</div>
+
+<div class="loading" id="loading">
+  <div class="spinner"></div>
+  <span>正在检测…</span>
+</div>
+
+<div class="error-box" id="errorBox"></div>
+
+<div class="result" id="result">
+  <div class="image-wrap"><img id="resultImg" alt="检测结果"></div>
+  <div class="meta">
+    <h2 id="resultTitle">检测到 0 个目标</h2>
+    <div class="cards" id="cards"></div>
+    <div class="hint-box" id="hintBox" style="display:none"></div>
+  </div>
+</div>
+
+<script>
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('fileInput');
+const loading = document.getElementById('loading');
+const errorBox = document.getElementById('errorBox');
+const result = document.getElementById('result');
+const resultImg = document.getElementById('resultImg');
+const resultTitle = document.getElementById('resultTitle');
+const cards = document.getElementById('cards');
+const hintBox = document.getElementById('hintBox');
+const btnImg = document.getElementById('btnImg');
+const btnCam = document.getElementById('btnCam');
+const camPanel = document.getElementById('camPanel');
+const camStream = document.getElementById('camStream');
+const camStatus = document.getElementById('camStatus');
+
+// 模式切换
+btnImg.addEventListener('click', () => { switchMode('img'); });
+btnCam.addEventListener('click', () => { switchMode('cam'); });
+
+function switchMode(mode) {
+  if (mode === 'cam') {
+    btnImg.classList.remove('active');
+    btnCam.classList.add('active');
+    dropzone.style.display = 'none';
+    result.classList.remove('show');
+    camPanel.style.display = 'block';
+    // 检查流是否活着
+    camStream.onerror = () => {
+      camStatus.textContent = '❌ 无法连接摄像头流，请检查 USB 连接或后端日志';
+    };
+  } else {
+    btnCam.classList.remove('active');
+    btnImg.classList.add('active');
+    camPanel.style.display = 'none';
+    dropzone.style.display = 'flex';
+  }
+}
+
+// 拖拽/点击选图
+dropzone.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', () => { if (fileInput.files[0]) handleFile(fileInput.files[0]); });
+dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
+dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+dropzone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dropzone.classList.remove('dragover');
+  if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+});
+
+async function handleFile(file) {
+  errorBox.style.display = 'none';
+  result.classList.remove('show');
+  loading.classList.add('show');
+  const fd = new FormData();
+  fd.append('image', file);
+  try {
+    const resp = await fetch('/detect', { method: 'POST', body: fd });
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error);
+    showResult(data);
+  } catch (err) {
+    errorBox.textContent = '检测失败: ' + err.message;
+    errorBox.style.display = 'block';
+  } finally {
+    loading.classList.remove('show');
+  }
+}
+
+function showResult(data) {
+  const dets = data.detections;
+  resultImg.src = 'data:image/jpeg;base64,' + data.annotated_b64;
+  resultTitle.textContent = `检测到 ${dets.length} 个目标 (原图 ${data.orig_size[0]}×${data.orig_size[1]})`;
+  cards.innerHTML = '';
+  dets.forEach((d) => {
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = `
+      <div class="label">${d.class} · conf ${d.conf}</div>
+      <div class="value angle">${d.theta_deg}°</div>
+      <div class="label" style="margin-top:6px">角度 ${d.theta_rad} rad</div>
+      <div class="label" style="margin-top:4px">中心 (${d.cx}, ${d.cy})</div>
+      <div class="label">尺寸 ${d.w} × ${d.h}</div>`;
+    cards.appendChild(card);
+  });
+  if (data.hint) { hintBox.textContent = data.hint; hintBox.style.display = 'block'; }
+  else hintBox.style.display = 'none';
+  result.classList.add('show');
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+
+# Keil MDK build output (regenerable via Build)
+MDK-ARM/arm-grasp/
+
+# Keil per-user GUI layout
+*.uvguix.*
+
+# OS junk
+Thumbs.db
+desktop.ini
