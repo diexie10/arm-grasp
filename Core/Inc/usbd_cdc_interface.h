@@ -1,17 +1,11 @@
 /**
   ******************************************************************************
   * @file    usbd_cdc_interface.h
-  * @brief   Header for usbd_cdc_interface.c
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
-  *
+  * @brief   Command processor interface (USART3 + CH340 serial bridge).
+  *          (v2.1: USB CDC removed — file name kept for Keil compatibility.)
   ******************************************************************************
   */
 
-/* Define to prevent recursive inclusion -------------------------------------*/
 #ifndef __USBD_CDC_IF_H
 #define __USBD_CDC_IF_H
 
@@ -19,22 +13,20 @@
 extern "C" {
 #endif
 
-/* Includes ------------------------------------------------------------------*/
-#include "usbd_cdc.h"
+#include <stdint.h>
 
-/* Exported types ------------------------------------------------------------*/
-/* Exported constants --------------------------------------------------------*/
+/* Buffer sizes */
 #define CDC_RX_BUFFER_SIZE   512U
-#define CDC_TX_BUFFER_SIZE   512U
 
-/* Exported macro ------------------------------------------------------------*/
 /* Exported functions --------------------------------------------------------*/
-extern USBD_CDC_ItfTypeDef USBD_Interface_fops_FS;
-
-/* Send a string back to the PC over the USART3 serial bridge (blocking).
- * Returns 0 on success, -1 if the TX buffer is busy. */
+/* Send a string back to the PC over USART3 (blocking, register-level). */
 int8_t CDC_SendString(const char *str);
+
+/* Called from USART3 ISR: push received byte into ring buffer. */
 void UART_RxByte(uint8_t byte);
+
+/* Lazy-start no-op: RXNEIE already enabled by MX_USART3_UART_Init. */
+void UART_StartRx(void);
 
 /* Called from main loop: process any received command line. */
 void CDC_ProcessRx(void);

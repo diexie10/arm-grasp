@@ -19,9 +19,6 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "usbd_core.h"
-#include "usbd_desc.h"
-#include "usbd_cdc.h"
 #include "usbd_cdc_interface.h"
 
 /* Private includes ----------------------------------------------------------*/
@@ -53,8 +50,6 @@
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim2;
 
-USBD_HandleTypeDef hUsbDeviceFS;
-
 /* USER CODE BEGIN PV */
 
 /* USER CODE END PV */
@@ -65,7 +60,6 @@ static void MX_GPIO_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_IWDG_Init(void);
-static void MX_USB_DEVICE_Init(void);
 static void MX_USART3_UART_Init(void);
 void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
 /* USER CODE BEGIN PFP */
@@ -107,7 +101,6 @@ int main(void)
   MX_GPIO_Init();
   MX_TIM1_Init();
   MX_TIM2_Init();
-  MX_USB_DEVICE_Init();
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
 
@@ -132,7 +125,7 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    /* Process incoming USB CDC commands */
+    /* Process incoming USART3 commands */
     CDC_ProcessRx();
     /* No-command timeout: hold position if the PC went silent. */
     CDC_TimeoutCheck();
@@ -153,7 +146,6 @@ void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
@@ -183,13 +175,7 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
-
-  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USB;
-  PeriphClkInit.UsbClockSelection = RCC_USBCLKSOURCE_PLL_DIV1_5;
-  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  /* USB clock config removed — project uses USART3 + CH340. */
 }
 
 /**
@@ -312,49 +298,6 @@ static void MX_GPIO_Init(void)
 }
 
 /**
-  * @brief USB Device Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USB_DEVICE_Init(void)
-{
-  /* USER CODE BEGIN USB_DEVICE_Init_PreTreatment */
-  /* D+ pull-up timing control: drive PA12 (USB_DP) low for 5 ms so the host
-   * sees a clean disconnect then reconnect only once the USB stack is ready.
-   * The board has a fixed external 1.5k pull-up on DP; pulling PA12 low
-   * overrides it for the duration. HAL_PCD_MspInit re-configures PA12 as
-   * AF on USBD_Init below, which releases DP and lets the host re-detect. */
-  {
-    GPIO_InitTypeDef GPIO_InitStruct = {0};
-    __HAL_RCC_GPIOA_CLK_ENABLE();
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_RESET);
-    GPIO_InitStruct.Pin = GPIO_PIN_12;
-    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-    HAL_Delay(5);
-  }
-  /* USER CODE END USB_DEVICE_Init_PreTreatment */
-  if (USBD_Init(&hUsbDeviceFS, &FS_Desc, 0U) != USBD_OK)
-  {
-    Error_Handler();
-  }
-  if (USBD_RegisterClass(&hUsbDeviceFS, &USBD_CDC) != USBD_OK)
-  {
-    Error_Handler();
-  }
-  if (USBD_CDC_RegisterInterface(&hUsbDeviceFS, &USBD_Interface_fops_FS) != USBD_OK)
-  {
-    Error_Handler();
-  }
-  if (USBD_Start(&hUsbDeviceFS) != USBD_OK)
-  {
-    Error_Handler();
-  }
-}
-
-/**
   * @brief USART3 Initialization (serial command bridge) - register level.
   *        PB10 = TX (AF_PP), PB11 = RX (input float), 115200 8N1.
   *        PCLK1 = 36 MHz -> BRR = 0x1388 (USARTDIV = 36e6/115200 = 312.5).
@@ -381,7 +324,7 @@ static void MX_USART3_UART_Init(void)
   USART3->BRR = 0x1388U;
   USART3->CR2 = 0U;
   USART3->CR3 = 0U;
-  USART3->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_RXNEIE;
+  USART3->CR1 = USART_CR1_UE | USART_CR1_TE | USART_CR1_RE | USART_CR1_RXNEIE;
 
   /* NVIC */
   HAL_NVIC_SetPriority(USART3_IRQn, 0, 0);

@@ -5,6 +5,70 @@
 
 ---
 
+## 2026-08-21（外部审核验证 + UE 修复 + USB 栈彻底删除）
+
+### 本轮做了什么
+1. **外部 AI 审核甄别**（10 条）：8 条确认正确、1 条仅适用副本（YOLO 路径）、1 条部分正确（DESCEND 设计意图）
+2. **P0 修复——USART3 缺 UE 位**：main.c L384 缺 USART_CR1_UE（bit13），USART3 完全死掉。**此 bug 为前轮写 UART 代码时引入，之前所有审查未发现**
+3. **P0 修复——H 命令语义分裂**：固件 H 设全 90° 舵机角 vs PC home() 设 JOINT_HOME=[90,45,60,-15,0,90]→舵机[90,135,60,75,90,90]。改为 H 下发 JOINT_HOME 对应舵机角
+4. **P1 修复——H 不再调 Servo_EnableAll**：改逐关节 Servo_SetAngle（保留懒启动）；Servo_EnableAll 用 #if 0 封存
+5. **P2 修复——超时续命**：last_cmd_tick 移到校验通过后刷新；坏校验行不再给 10s 安全兜底续命
+6. **P2 修复——DRY_RUN clamp**：_dry_echo 改用固件 joint_min/max 表（舵机角域）
+7. **P2 修复——SEARCH 过冲**：move_to 加 overshoot=False
+8. **USB CDC 彻底删除**：
+   - usbd_cdc_interface.c 重写为纯命令处理器（无任何 USB 代码）
+   - usbd_cdc_interface.h 清理（去 USBD 类型/include）
+   - main.c 删 MX_USB_DEVICE_Init + hUsbDeviceFS + USB include + USB 时钟配置
+   - stm32f1xx_it.c 删 USB_LP_CAN1_RX0_IRQHandler + PCD extern
+   - hal_conf.h 禁用 HAL_PCD_MODULE_ENABLED
+   - middleware 4 文件 + usbd_conf.c + usbd_desc.c 全部替换为空壳 stub
+   - **代码体积 16.97KB → 7.20KB（减 58%）**
+
+### 验证
+- Keil 编译 0 Error 0 Warning
+- py_compile 通过
+- grep 确认无活跃 USB 引用（仅文件名/注释残留）
+
+---
+
+
+## 2026-08-21（前沿调研 + 螺旋扫落地）
+
+### 本轮做了什么
+1. **前沿调研两轮**（LeRobot 生态 / STM32 舵机臂 / 视觉伺服），归档 `docs/knowledge/外部调研-前沿机械臂代码设计.md`
+   - 战略结论：**STS3215 总线舵机是第二代明确答案**（位置反馈解决 KNOWN_TRAPS #19 + LeRobot 生态兼容），ch09 已更新
+   - UTwente 2026 论文：解析状态机胜过 RL 零样本迁移（验证我们的架构路线）；螺旋搜索补偿接触阶段对准误差
+   - VisionTouch 三教训：IBVS 轴反转（SERVO_KP 符号依据）/假收敛过滤/FOV≥90°
+2. **螺旋微搜索落地**：`_spiral_search()`（阿基米德螺线，FK+IK 保持 z 不变，越限点跳过，禁过冲）接入视觉/旧路线两条 DESCEND 失败路径；config.SPIRAL_* 参数化 + STATE_TIMEOUTS["SPIRAL"]
+3. **验证**：py_compile 通过；(150,20,80) 场景 12/12 点可达、半径单调递增；DRY_RUN 构造冒烟通过。注意可达包络：J1∈[0,180°] 只覆盖 y≥0 半平面——起点必然可达（刚移动过去），不可达点跳过即设计行为
+
+### 未烧录
+固件含 checksum + 懒启动 + 270° 适配 + 本轮全部改动，待 ST-LINK
+
+---
+
+
+## 2026-08-21（Panthera-HT SDK 深挖 + 协议加固）
+
+### 本轮做了什么
+1. **Panthera-HT SDK 深度代码审查**（用户要求深挖代码而非看 README）：证实 README 吹的"自适应阻尼 IK"实为固定 damp=1e-12；真亮点 = 双 CRC 二进制协议、固件级电机超时、错误自恢复线程、限位拒绝哲学、recorder 轨迹回放
+2. **协议加固落地**：
+   - 固件 `Cmd_CheckChecksum` + `HexNibble`：可选 "*XX" XOR 校验后缀，失败回 "ERR CKS" 拒绝执行；无后缀裸命令仍接受（手动测试兼容）；CDC_ProcessRx 接入门控
+   - 上位机 `_checksum()`：_send 自动附加校验后缀（DRY_RUN 路径不受影响）
+3. **限位预检拒绝**：move_joint 发送前检查 JOINT_MIN/MAX（LIMIT_EPS 容差），越限直接 REJECT 不发送——规划层早暴露 IK 问题，固件钳位降级为最后防线（Panthera 哲学）
+4. **否决 wait_reached 轮询方案**：S 命令返回命令值非物理值（MG996R 开环无反馈，KNOWN_TRAPS #19），"查询即验证"在此硬件上是自欺——诚实结论而非照抄 Panthera（它有编码器才配得上 iswait）
+
+### 验证
+- Keil 编译 0 Error；py_compile 通过
+- 校验和手算验证："M2 90" → XOR=0x56 → "M2 90*56"，固件截断后 Cmd_Execute 正常解析
+- 全部 move_joint 调用方核查：trajectory 已 clip、align 已 clamp、IK 已拒不可达、GRIP 值在 J6 限位内——预检无误拒风险
+
+### 未烧录
+新固件待 ST-LINK 连接后烧录（含本轮 checksum + 上轮懒启动/270° 适配）
+
+---
+
+
 ## 2026-08-21（外部审核甄别 + P0 安全修复）
 
 ### 本轮做了什么

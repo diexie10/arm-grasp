@@ -1,13 +1,20 @@
 # -*- coding: utf-8 -*-
-"""arm_serial.py — 与 STM32 固件的 USB CDC 通信层。
+"""arm_serial.py — 与 STM32 固件的 USART3 串口通信层。
 
-协议（固件 usbd_cdc_interface.c v1.1，CRLF 结尾）：
+协议（固件 usbd_cdc_interface.c，CRLF 结尾）：
     M<n> <angle>  → OK M<n> <clamped_angle>  （回显 clamp 后的实际角度！）
     MALL <a1..a6> → OK MALL ...
     S             → OK S1=<a1> ... S6=<a6>    （当前关节状态）
     I             → OK IR1=<0|1> IR2=<0|1>    （遮挡=0）
     H             → OK H（全回中位 + 清急停）
     E             → OK E（急停：停全部 PWM，拒绝 M 直到 H）
+
+校验和（借鉴 Panthera-HT 双 CRC，文本协议简化版）：
+    本模块发送的每条命令自动附加 "*XX" 后缀（XX = 命令字节的 XOR，
+    两位大写十六进制）。固件校验失败回 "ERR CKS" 并拒绝执行——
+    防止舵机 EMI 把 "M2 90" 干扰成 "M2 98"（错角度）或 "M5 90"（错关节）。
+    无 "*XX" 的裸命令固件仍接受（串口助手手动测试用）。
+    应答方向不加校验：回显铁律的角度交叉核对已覆盖该方向。
 
 回显铁律（架构书 §6 / CLAUDE.md）：M<n> 回显 clamp 后实际角度，
 本模块必须解析回显更新 joint_state；请求 vs 回显偏差 > ANGLE_ECHO_TOL
@@ -21,6 +28,14 @@ import serial  # pip install pyserial
 
 import config
 from kinematics import from_servo, to_servo
+
+
+def _checksum(cmd):
+    """命令字节 XOR 校验和，两位大写十六进制。"""
+    x = 0
+    for ch in cmd:
+        x ^= ord(ch)
+    return "%02X" % x
 
 
 class ArmSerial:
@@ -49,12 +64,17 @@ class ArmSerial:
 
     # ---------- 底层 ----------
     def _send(self, cmd, timeout=None):
-        """发命令并读一行应答。返回应答字符串（去 CRLF）或 None（超时）。"""
+        """发命令并读一行应答。返回应答字符串（去 CRLF）或 None（超时）。
+
+        真实串口路径自动附加 "*XX" XOR 校验后缀（固件校验失败回 ERR CKS）；
+        DRY_RUN 路径传裸命令（_dry_echo 的正则按裸命令匹配）。
+        """
         if self.dry_run:
             return self._dry_echo(cmd)
         timeout = timeout or config.RESP_TIMEOUT
         assert self._ser is not None
-        self._ser.write((cmd + "\r\n").encode())
+        payload = "%s*%s" % (cmd, _checksum(cmd))
+        self._ser.write((payload + "\r\n").encode())
         deadline = time.time() + timeout
         while time.time() < deadline:
             line = self._ser.readline()
@@ -65,14 +85,18 @@ class ArmSerial:
         return None
 
     def _dry_echo(self, cmd):
-        """DRY_RUN 假回显：模拟固件视角——收到舵机角，clamp [0,180] 回显。
+        """DRY_RUN 假回显：模拟固件视角——收到舵机角，按关节限位 clamp 后回显。
 
         注意：move_joint 已做关节角→舵机角转换，这里绝不能再 +OFFSET（双重转换 bug）。
+        clamp 用固件的 joint_min/max（舵机角域），与真实固件行为一致。
         """
         m = re.match(r"^M(\d)\s+([-\d.]+)$", cmd)
         if m:
             n, a = int(m.group(1)), float(m.group(2))
-            servo = max(0.0, min(180.0, a))      # 固件 clamp 舵机角 [0,180]
+            # 固件限位表（usbd_cdc_interface.c joint_min/max，舵机角域）
+            fw_min = [0, 30, 10, 0, 45, 30]
+            fw_max = [180, 180, 150, 180, 135, 120]
+            servo = max(float(fw_min[n - 1]), min(float(fw_max[n - 1]), a))
             return "OK M%d %.1f" % (n, servo)
         if cmd.startswith("MALL"):
             return "OK MALL"
@@ -112,6 +136,14 @@ class ArmSerial:
         n = int(n)
         if not 1 <= n <= 6:
             return False, "ERR: joint out of range"
+        # 限位预检拒绝（Panthera-HT 哲学）：规划层直接拒绝越限目标，
+        # 早暴露 IK/伺服问题；固件钳位只是最后防线，不该被当常规路径。
+        lo, hi = config.JOINT_MIN[n - 1], config.JOINT_MAX[n - 1]
+        if not (lo - config.LIMIT_EPS <= angle <= hi + config.LIMIT_EPS):
+            msg = ("REJECT: joint %d target %+.1f outside limits [%+.1f, %+.1f]"
+                   % (n, angle, lo, hi))
+            self.last_warning = msg
+            return False, msg
         servo = angle + config.JOINT_OFFSET[n - 1]      # 关节角 → 舵机角
         resp = self._send("M%d %.1f" % (n, servo))
         if resp is None:

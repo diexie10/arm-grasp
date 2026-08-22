@@ -22,6 +22,7 @@
 """
 
 import logging
+import math
 import time
 
 import cv2
@@ -96,6 +97,48 @@ class StateMachine:
         """当前关节角是否在 HOME（甜区）附近（容差 tol°）。"""
         return all(abs(self.serial.joint_state[i] - config.JOINT_HOME[i]) <= tol
                    for i in range(6))
+
+    def _spiral_search(self, t0):
+        """DESCEND 红外未触发时的微搜索：当前高度做阿基米德螺线扫描。
+
+        UTwente 2026：接触阶段螺旋搜索补偿残余对准误差——覆盖均匀、
+        无方向偏好，优于十字扫。每点经 FK+IK 保持 z 不变（水平不漂移），
+        越限/不可达点跳过；移动禁消隙过冲（近距过冲会撞物）。
+
+        Returns:
+            True = 红外触发（当前位置即抓取位，调用方继续 GRIP 流程）
+            False = 扫完全部点未触发（调用方转 ERROR）
+        """
+        if not config.SPIRAL_ENABLED:
+            return False
+        self._set_state("SPIRAL")
+        x0, y0, z0 = kinematics.fk(self.serial.joint_state)
+        print("[SM] SPIRAL: 起点 (%.0f, %.0f, %.0f) mm，%d 点 / %d 圈 / R=%.0fmm"
+              % (x0, y0, z0, config.SPIRAL_POINTS, config.SPIRAL_TURNS,
+                 config.SPIRAL_R_MAX))
+        for k in range(1, config.SPIRAL_POINTS + 1):
+            if self._timeout(t0, "SPIRAL"):
+                return False
+            frac = float(k) / config.SPIRAL_POINTS
+            r = config.SPIRAL_R_MAX * frac
+            th = 2.0 * math.pi * config.SPIRAL_TURNS * frac
+            xs = x0 + r * math.cos(th)
+            ys = y0 + r * math.sin(th)
+            q, reason = kinematics.ik_solve(xs, ys, z0, config.GRIP_OPEN)
+            if q is None:
+                continue                     # 越限/不可达点跳过
+            try:
+                self.traj.move_to(self.serial, q, overshoot=False)
+            except TrajectoryError:
+                continue                     # 单点失败不放弃整轮螺旋
+            time.sleep(config.SPIRAL_SETTLE_MS / 1000.0)
+            blocked = self.ir.wait_blocked(config.IR_POLL_MS)
+            print("[SM] SPIRAL %d/%d: (%.0f, %.0f) IR=%s"
+                  % (k, config.SPIRAL_POINTS, xs, ys, blocked))
+            if blocked:
+                print("[SM] SPIRAL: 红外触发于第 %d 点" % k)
+                return True
+        return False
 
     # ---------- 视觉伺服 ----------
     def _servo_align(self, t0, state):
@@ -216,7 +259,8 @@ class StateMachine:
                         nq = q[0] + search_dir * config.SEARCH_ANGLE_STEP
                     q[0] = nq
                     try:
-                        self.traj.move_to(self.serial, q)
+                        # 扫描运动禁消隙过冲：反向时 15° 过冲会让画面跳变、扫描非单调
+                        self.traj.move_to(self.serial, q, overshoot=False)
                     except TrajectoryError as e:
                         return self._to_error("SEARCH move: %s" % e)
                     time.sleep(config.ALIGN_POLL_MS / 1000.0)
@@ -295,8 +339,11 @@ class StateMachine:
                     if descend_ok is False:
                         break
                 else:
-                    return self._to_error("DESCEND: 未触发红外（%d 级）"
-                                          % config.DESCEND_LEVELS)
+                    # 全部下降档未触发红外 → 螺旋微搜索（当前高度，补偿
+                    # 残余对准误差）；扫到则继续 FINAL_ALIGN，否则报错
+                    if not self._spiral_search(t0):
+                        return self._to_error("DESCEND: 未触发红外（%d 级）"
+                                              % config.DESCEND_LEVELS)
                 if descend_ok is False:
                     continue  # 目标丢失 → 回 SEARCH 重扫
 
@@ -384,8 +431,10 @@ class StateMachine:
                 if self.ir.wait_blocked(300):      # 红外触发 = 末端已接触目标
                     break
             else:
-                return self._to_error(
-                    "DESCEND: no IR trigger within %.0f mm" % config.DESCEND_MAX)
+                # 下降全程未触发红外 → 螺旋微搜索（旧路线同样受益）
+                if not self._spiral_search(t0):
+                    return self._to_error(
+                        "DESCEND: no IR trigger within %.0f mm" % config.DESCEND_MAX)
 
         # 4. GRIP：夹爪闭合，等待
         self._set_state("GRIP")

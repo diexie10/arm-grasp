@@ -1,32 +1,23 @@
 /**
   ******************************************************************************
   * @file    usbd_cdc_interface.c
-  * @brief   USB CDC interface: ring buffer, TX, and command processing
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
-  *
+  * @brief   Command processor: UART RX ring, servo PWM, safety layer.
+  *          (v2.1: USB CDC removed — project uses USART3 + CH340 serial bridge.
+  *           File name kept for Keil project compatibility.)
   ******************************************************************************
   */
 
 /* Includes ------------------------------------------------------------------*/
+#include <stdio.h>
 #include "usbd_cdc_interface.h"
-#include "usbd_cdc.h"
-#include "usbd_conf.h"
 #include "main.h"
 
-/* Private typedef -----------------------------------------------------------*/
 /* Private define ------------------------------------------------------------*/
 /* No-command timeout: hold position after this many ms without any command. */
 #define CMD_TIMEOUT_MS   10000U
 
-/* Private macro -------------------------------------------------------------*/
 /* Private variables ---------------------------------------------------------*/
-static uint8_t UserRxBufferFS[CDC_RX_BUFFER_SIZE];
-
-/* RX ring buffer */
+/* RX ring buffer (fed by UART_RxByte from USART3 ISR) */
 static volatile uint16_t rx_head = 0U;   /* next write position (ISR)   */
 static volatile uint16_t rx_tail = 0U;   /* next read position (main)   */
 static uint8_t rx_ring[CDC_RX_BUFFER_SIZE];
@@ -43,16 +34,12 @@ static volatile uint16_t servo_angle[6] = {90U, 90U, 90U, 90U, 90U, 90U};
 /* Per-channel PWM enable flags. A channel is started LAZILY by its first
  * Servo_SetAngle call, so power-up and timeout recovery draw zero current
  * until the PC explicitly commands that servo - this is what makes the
- * PC-side soft start (M1..M6, 200 ms apart) actually sequence the inrush.
- * Cleared by Servo_DisableAll (E-stop / USB loss / timeout). */
+ * PC-side soft start (M1..M6, 200 ms apart) genuinely sequence the inrush.
+ * Cleared by Servo_DisableAll (E-stop / timeout). */
 static uint8_t servo_enabled[6] = {0U, 0U, 0U, 0U, 0U, 0U};
 
 /* Joint angle limits (servo degrees, 0-270 = 0.5-2.5ms PWM on 270-deg servos).
- * Values from design doc, TBD after real measurement of the mechanical
- * stops (see docs/诚实声明与技术债务清单.md). These are SERVO angles;
- * the PC maps joint angles via JOINT_OFFSET in config.py:
- *   J1[0,180] J2[30,180] J3[10,150] J4[0,180] J5[45,135] J6[30,120]
- * (limits kept conservative at 0-180 until stage-6 measurement) */
+ * Conservative 0-180 band until stage-6 measurement (see docs). */
 static const uint16_t joint_min[6] = {0U, 30U, 10U, 0U, 45U, 30U};
 static const uint16_t joint_max[6] = {180U, 180U, 150U, 180U, 135U, 120U};
 
@@ -62,253 +49,102 @@ static volatile uint8_t timeout_active   = 0U; /* no command for 10s          */
 static volatile uint32_t last_cmd_tick   = 0U; /* HAL tick of last command    */
 
 /* Private function prototypes -----------------------------------------------*/
-static int8_t CDC_Init_FS(void);
-static int8_t CDC_DeInit_FS(void);
-static int8_t CDC_Control_FS(uint8_t cmd, uint8_t *pbuf, uint16_t length);
-static int8_t CDC_Receive_FS(uint8_t *Buf, uint32_t *Len);
-static int8_t CDC_TransmitCplt_FS(uint8_t *Buf, uint32_t *Len, uint8_t epnum);
-
 static void Servo_SetAngle(uint8_t ch, uint16_t angle);
 static void Servo_SetAll(uint16_t angle);
 static void Servo_DisableAll(void);
-static void Servo_EnableAll(void);
+static uint8_t HexNibble(char c);
+static uint8_t Cmd_CheckChecksum(char *line);
 static void Cmd_Execute(const char *line);
 
 /* Exported variables --------------------------------------------------------*/
-extern USBD_HandleTypeDef hUsbDeviceFS;
 extern TIM_HandleTypeDef htim1;
 extern TIM_HandleTypeDef htim2;
 
-USBD_CDC_ItfTypeDef USBD_Interface_fops_FS =
-{
-  CDC_Init_FS,
-  CDC_DeInit_FS,
-  CDC_Control_FS,
-  CDC_Receive_FS,
-  CDC_TransmitCplt_FS
-};
-
-/* Private functions ---------------------------------------------------------*/
-
 /**
-  * @brief  CDC interface init.
-  * @retval status
-  */
-static int8_t CDC_Init_FS(void)
-{
-  /* USB CDC is DEPRECATED on this board (it enumerates but Windows never
-   * registers the device; commands and replies use the USART3 bridge).
-   * Do NOT enable servos here: enabling is owned exclusively by explicit
-   * USART3 commands through the lazy per-channel start in Servo_SetAngle.
-   * A hidden enable path here would bypass the PC-side soft start. */
-  USBD_CDC_SetRxBuffer(&hUsbDeviceFS, UserRxBufferFS);
-  USBD_CDC_ReceivePacket(&hUsbDeviceFS);
-  return 0;
-}
-
-/**
-  * @brief  CDC interface de-init.
-  * @retval status
-  */
-static int8_t CDC_DeInit_FS(void)
-{
-  /* USB is retired to a pure-enumeration stub: the command/reply path is
-   * the USART3 bridge, so USB bus events (reset / suspend / unplug) must
-   * NOT stop the servos or flush the command ring - a host reboot must not
-   * make a grasped object fall. Servo power is governed solely by E-stop,
-   * the 10 s command timeout, and per-command lazy starts. */
-  return 0;
-}
-
-/**
-  * @brief  CDC control (line coding etc.).
-  * @retval status
-  */
-static int8_t CDC_Control_FS(uint8_t cmd, uint8_t *pbuf, uint16_t length)
-{
-  switch (cmd)
-  {
-    case CDC_SET_LINE_CODING:
-      break;
-    case CDC_GET_LINE_CODING:
-      break;
-    case CDC_SET_CONTROL_LINE_STATE:
-      break;
-    default:
-      break;
-  }
-  UNUSED(pbuf);
-  UNUSED(length);
-  return 0;
-}
-
-/**
-  * @brief  CDC receive callback: push data into the ring buffer.
-  * @retval status
-  */
-static int8_t CDC_Receive_FS(uint8_t *Buf, uint32_t *Len)
-{
-  /* USB CDC RX is retired: the USART3 bridge (UART_RxByte) is the ONLY
-   * command input. Bytes arriving over USB are discarded - feeding them
-   * into rx_ring would make it a multi-writer ring shared by two ISR
-   * contexts for no benefit. */
-  UNUSED(Buf);
-  UNUSED(Len);
-  /* Re-arm the receive so the host's writer does not stall. */
-  USBD_CDC_ReceivePacket(&hUsbDeviceFS);
-  return 0;
-}
-
-/**
-  * @brief  CDC transmit complete callback.
-  * @retval status
-  */
-static int8_t CDC_TransmitCplt_FS(uint8_t *Buf, uint32_t *Len, uint8_t epnum)
-{
-  UNUSED(Buf);
-  UNUSED(Len);
-  UNUSED(epnum);
-  return 0;
-}
-
-/**
-  * @brief  Push one USART3 received byte into the shared command ring.
-  *         Called from USART3_IRQHandler (ISR context).
-  * @param  byte: received byte
-  * @retval None
+  * @brief  Called from the USART3 ISR when a byte arrives. Pushes into ring.
+  *         Ring-full policy: drop silently (command rate << buffer capacity).
+  * @param  byte  received byte
   */
 void UART_RxByte(uint8_t byte)
 {
   uint16_t next = (uint16_t)((rx_head + 1U) % CDC_RX_BUFFER_SIZE);
-  if (next != rx_tail)
+  if (next != rx_tail)                   /* not full */
   {
     rx_ring[rx_head] = byte;
     rx_head = next;
   }
-  /* else: ring full, byte dropped (same policy as the USB CDC path). */
 }
 
 /**
-  * @brief  Send a string back to the PC.
-  *         Replies go over the USART3 serial bridge (register-level,
-  *         blocking TX) since USB CDC is not usable on this board.
-  * @retval 0 on success
+  * @brief  Lazy-start no-op: RXNEIE is already enabled by MX_USART3_UART_Init.
+  */
+void UART_StartRx(void)
+{
+}
+
+/**
+  * @brief  Blocking transmit over USART3 (register-level polling).
+  *         Called from main-loop context only (Cmd_Execute), never ISR.
+  * @param  str  NUL-terminated string (includes \r\n)
   */
 int8_t CDC_SendString(const char *str)
 {
-  uint16_t len = 0U;
-  uint16_t i;
-  while (str[len] != '\0')
+  while (*str != '\0')
   {
-    len++;
+    while ((USART3->SR & USART_SR_TXE) == 0U) { /* wait TX empty */ }
+    USART3->DR = (uint16_t)(*str++);
   }
-  if (len == 0U)
-  {
-    return 0;
-  }
-  if (len > CDC_TX_BUFFER_SIZE)
-  {
-    len = CDC_TX_BUFFER_SIZE;
-  }
-  /* Blocking transmit; called from main-loop context only (Cmd_Execute),
-   * never from an ISR. Short replies at 115200 take ~1-5 ms, well within
-   * the 2 s watchdog budget. */
-  for (i = 0U; i < len; i++)
-  {
-    while ((USART3->SR & USART_SR_TXE) == 0U)
-    {
-    }
-    USART3->DR = (uint16_t)str[i];
-  }
-  while ((USART3->SR & USART_SR_TC) == 0U)
-  {
-  }
+  while ((USART3->SR & USART_SR_TC) == 0U) { /* wait transmission complete */ }
   return 0;
 }
 
 /**
-  * @brief  Set one servo angle, clamped to the joint limits.
+  * @brief  Set servo angle (clamped) and lazily start its PWM channel.
+  * @param  ch     channel index 0..5
+  * @param  angle  requested servo angle (degrees)
   */
 static void Servo_SetAngle(uint8_t ch, uint16_t angle)
 {
-  uint32_t cmp;
-  if (ch >= 6U)
-  {
-    return;
-  }
-  /* Clamp to joint limit (safety layer L2). */
-  if (angle < joint_min[ch])
-  {
-    angle = joint_min[ch];
-  }
-  if (angle > joint_max[ch])
-  {
-    angle = joint_max[ch];
-  }
-  servo_angle[ch] = angle;
-  cmp = SERVO_MIN_PULSE + ((uint32_t)angle * (SERVO_MAX_PULSE - SERVO_MIN_PULSE)) / SERVO_MAX_ANGLE;
+  uint16_t cmp;
+  TIM_HandleTypeDef *tim;
+  uint32_t chan;
 
+  if (ch >= 6U) return;
+
+  /* Clamp to joint limits */
+  if (angle < joint_min[ch]) { angle = joint_min[ch]; }
+  if (angle > joint_max[ch]) { angle = joint_max[ch]; }
+
+  /* Angle -> pulse width -> compare value (270-deg servos) */
+  cmp = SERVO_MIN_PULSE +
+        ((uint32_t)angle * (SERVO_MAX_PULSE - SERVO_MIN_PULSE)) / SERVO_MAX_ANGLE;
+
+  /* Select timer/channel */
   switch (ch)
   {
-    /* Compare is written BEFORE the lazy start so the very first pulse the
-     * servo ever sees already carries the commanded width (never the timer
-     * reset default). The start is gated on estop_active: an M command
-     * during an E-stop must only update the stored angle, never re-power
-     * the channel (the E command stops PWM; 'H' is the explicit recovery). */
-    case 0U:
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, cmp);
-      if ((servo_enabled[0] == 0U) && (estop_active == 0U))
-      {
-        servo_enabled[0] = 1U;
-        HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
-      }
-      break;
-    case 1U:
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, cmp);
-      if ((servo_enabled[1] == 0U) && (estop_active == 0U))
-      {
-        servo_enabled[1] = 1U;
-        HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
-      }
-      break;
-    case 2U:
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, cmp);
-      if ((servo_enabled[2] == 0U) && (estop_active == 0U))
-      {
-        servo_enabled[2] = 1U;
-        HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
-      }
-      break;
-    case 3U:
-      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, cmp);
-      if ((servo_enabled[3] == 0U) && (estop_active == 0U))
-      {
-        servo_enabled[3] = 1U;
-        HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
-      }
-      break;
-    case 4U:
-      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, cmp);
-      if ((servo_enabled[4] == 0U) && (estop_active == 0U))
-      {
-        servo_enabled[4] = 1U;
-        HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
-      }
-      break;
-    case 5U:
-      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, cmp);
-      if ((servo_enabled[5] == 0U) && (estop_active == 0U))
-      {
-        servo_enabled[5] = 1U;
-        HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
-      }
-      break;
-    default: break;
+    case 0: tim = &htim1; chan = TIM_CHANNEL_1; break;
+    case 1: tim = &htim1; chan = TIM_CHANNEL_2; break;
+    case 2: tim = &htim1; chan = TIM_CHANNEL_3; break;
+    case 3: tim = &htim2; chan = TIM_CHANNEL_1; break;
+    case 4: tim = &htim2; chan = TIM_CHANNEL_2; break;
+    default: tim = &htim2; chan = TIM_CHANNEL_3; break;
+  }
+
+  __HAL_TIM_SET_COMPARE(tim, chan, cmp);
+  servo_angle[ch] = angle;
+
+  /* Lazy start: only enable PWM on first command for this channel. */
+  if ((servo_enabled[ch] == 0U) && (estop_active == 0U))
+  {
+    servo_enabled[ch] = 1U;
+    HAL_TIM_PWM_Start(tim, chan);
   }
 }
 
 /**
-  * @brief  Set all servos to the same angle.
+  * @brief  Set all six servo angles (each clamped independently).
+  * @param  angle  requested angle
+  * @note   Echoes the REQUESTED angle; query 'S' for actual positions.
   */
 static void Servo_SetAll(uint16_t angle)
 {
@@ -320,58 +156,61 @@ static void Servo_SetAll(uint16_t angle)
 }
 
 /**
-  * @brief  Stop PWM on all 6 channels. Servos lose the signal and go limp
-  *         (no torque). Used on E-stop and USB disconnect.
+  * @brief  Stop all PWM outputs (servos go limp / unpowered).
   */
 static void Servo_DisableAll(void)
 {
+  uint8_t i;
   HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
   HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_2);
   HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_3);
   HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_1);
   HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2);
   HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_3);
-  /* Clear the lazy-start flags so the next command per channel genuinely
-   * re-powers it through Servo_SetAngle (never a bulk blind start). */
-  servo_enabled[0] = 0U;
-  servo_enabled[1] = 0U;
-  servo_enabled[2] = 0U;
-  servo_enabled[3] = 0U;
-  servo_enabled[4] = 0U;
-  servo_enabled[5] = 0U;
+  for (i = 0U; i < 6U; i++) { servo_enabled[i] = 0U; }
 }
 
 /**
-  * @brief  Restore PWM on all 6 channels at the last commanded angles.
-  *         Each Servo_SetAngle lazily starts its channel on first use, so
-  *         re-issuing the stored angles is sufficient - channels that are
-  *         already running are only updated, stopped ones are re-powered.
-  *
-  * @note   Used ONLY by 'H' (explicit user recovery). All six channels come
-  *         up within microseconds of each other; that is acceptable here
-  *         because recovery happens at held positions (hold current, no
-  *         acceleration inrush) and the PTC bounds any fault. Boot and the
-  *         timeout path deliberately do NOT call this: they rely on the
-  *         per-command lazy start so the PC soft start stays effective.
+  * @brief  Hex digit to nibble. Returns 0xFF for non-hex characters.
   */
-static void Servo_EnableAll(void)
+static uint8_t HexNibble(char c)
 {
-  uint8_t i;
-  for (i = 0U; i < 6U; i++)
+  if ((c >= '0') && (c <= '9')) { return (uint8_t)(c - '0'); }
+  if ((c >= 'A') && (c <= 'F')) { return (uint8_t)(c - 'A' + 10); }
+  if ((c >= 'a') && (c <= 'f')) { return (uint8_t)(c - 'a' + 10); }
+  return 0xFFU;
+}
+
+/**
+  * @brief  Verify optional "*XX" XOR checksum suffix on a command line.
+  * @param  line  command line (modified in place: truncated at '*')
+  * @retval 1 = valid (or absent), 0 = bad checksum
+  */
+static uint8_t Cmd_CheckChecksum(char *line)
+{
+  char *star = NULL;
+  const char *p;
+  uint8_t acc = 0U;
+  uint8_t hi, lo;
+
+  for (p = line; (*p != '\0') && (p < (line + sizeof(cmd_line))); p++)
   {
-    Servo_SetAngle(i, servo_angle[i]);
+    if (*p == '*') { star = (char *)p; break; }
   }
+  if (star == NULL) { return 1U; }
+  if ((star[1] == '\0') || (star[2] == '\0')) { return 0U; }
+  for (p = line; p < star; p++) { acc ^= (uint8_t)*p; }
+  hi = HexNibble(star[1]);
+  lo = HexNibble(star[2]);
+  if ((hi > 15U) || (lo > 15U)) { return 0U; }
+  if (acc != (uint8_t)((uint8_t)(hi << 4) | lo)) { return 0U; }
+  *star = '\0';
+  return 1U;
 }
 
 /**
   * @brief  Execute one command line.
-  *         Supported commands:
-  *           M<n> <angle>   move servo n (1..6) to angle (clamped to joint limits)
-  *           MALL <angle>   move all servos to angle
-  *           I              query IR sensors -> "IR1=x IR2=y"
-  *           S              query servo angles -> "S1=.. S2=.. ..."
-  *           H              home: all servos to 90 deg (also clears E-stop)
-  *           E              emergency stop: stop all PWM (servos go limp)
+  *         M<n> <angle> / MALL <angle> / I / S / H / E
   */
 static void Cmd_Execute(const char *line)
 {
@@ -383,38 +222,23 @@ static void Cmd_Execute(const char *line)
   {
     if (estop_active != 0U)
     {
-      /* E-stop active: refuse motion commands until 'H'. */
       CDC_SendString("ERR\r\n");
       return;
     }
     if ((line[1] == 'A') || (line[1] == 'a'))
     {
-      /* MALL <angle>. Each joint clamps to its own limit, so the echoed
-       * value is the requested one; query 'S' for actual positions.
-       * NOTE: unlike M<n>, MALL echoes the REQUESTED angle, not the clamped
-       * one - the PC must not treat this echo as actual joint state
-       * (arm_serial.py only parses "OK M<n> <angle>" echoes; trajectory.py
-       * avoids MALL entirely for this reason). */
       if (sscanf(line + 4, "%d", &ia) == 1)
       {
-        if (ia < 0)
-        {
-          CDC_SendString("ERR\r\n");
-          return;
-        }
+        if (ia < 0) { CDC_SendString("ERR\r\n"); return; }
         a = (uint16_t)ia;
         Servo_SetAll(a);
         sprintf(reply, "OK MALL %u\r\n", a);
         CDC_SendString(reply);
       }
-      else
-      {
-        CDC_SendString("ERR\r\n");
-      }
+      else { CDC_SendString("ERR\r\n"); }
     }
     else
     {
-      /* M<n> <angle> */
       if (sscanf(line + 1, "%d %d", &ia, &ib) == 2)
       {
         if ((ia >= 1) && (ia <= 6) && (ib >= 0))
@@ -422,19 +246,12 @@ static void Cmd_Execute(const char *line)
           a = (uint16_t)ia;
           b = (uint16_t)ib;
           Servo_SetAngle((uint8_t)(a - 1U), b);
-          /* Echo the clamped angle so the PC knows the real position. */
           sprintf(reply, "OK M%u %u\r\n", a, (uint16_t)servo_angle[a - 1U]);
           CDC_SendString(reply);
         }
-        else
-        {
-          CDC_SendString("ERR\r\n");
-        }
+        else { CDC_SendString("ERR\r\n"); }
       }
-      else
-      {
-        CDC_SendString("ERR\r\n");
-      }
+      else { CDC_SendString("ERR\r\n"); }
     }
   }
   else if ((line[0] == 'I') || (line[0] == 'i'))
@@ -454,15 +271,17 @@ static void Cmd_Execute(const char *line)
   }
   else if ((line[0] == 'H') || (line[0] == 'h'))
   {
-    /* Home: clear E-stop, re-enable PWM, move all servos to 90 deg. */
+    static const uint16_t home_servo[6] = {90U, 135U, 60U, 75U, 90U, 90U};
+    uint8_t hi;
     estop_active = 0U;
-    Servo_EnableAll();
-    Servo_SetAll(90U);
+    for (hi = 0U; hi < 6U; hi++)
+    {
+      Servo_SetAngle(hi, home_servo[hi]);
+    }
     CDC_SendString("OK H\r\n");
   }
   else if ((line[0] == 'E') || (line[0] == 'e'))
   {
-    /* Emergency stop: stop all PWM immediately (servos go limp). */
     estop_active = 1U;
     Servo_DisableAll();
     CDC_SendString("OK E\r\n");
@@ -489,20 +308,18 @@ void CDC_ProcessRx(void)
       if (cmd_len > 0U)
       {
         cmd_line[cmd_len] = '\0';
-        /* Any complete line means the PC is alive: reset timeout and, if the
-         * timeout had stopped the PWM, re-enable the servos at the last
-         * commanded angles before executing the new command. */
-        last_cmd_tick = HAL_GetTick();
-        if (timeout_active != 0U)
+        if (Cmd_CheckChecksum(cmd_line) == 0U)
         {
-          /* Clear the timeout flag ONLY. Do NOT bulk re-enable here: the
-           * executing command's Servo_SetAngle lazily restarts exactly the
-           * channel(s) it moves, so the soft-start property survives a PC
-           * silence timeout. Query commands (S/I) intentionally leave the
-           * arm limp until a real motion command arrives. */
-          timeout_active = 0U;
+          /* Corrupted command (EMI): refuse loudly, do NOT execute.
+           * Do NOT refresh last_cmd_tick either. */
+          CDC_SendString("ERR CKS\r\n");
         }
-        Cmd_Execute(cmd_line);
+        else
+        {
+          last_cmd_tick = HAL_GetTick();
+          if (timeout_active != 0U) { timeout_active = 0U; }
+          Cmd_Execute(cmd_line);
+        }
         cmd_len = 0U;
       }
     }
@@ -512,7 +329,6 @@ void CDC_ProcessRx(void)
     }
     else
     {
-      /* line too long: drop it */
       cmd_len = 0U;
     }
   }
@@ -520,9 +336,6 @@ void CDC_ProcessRx(void)
 
 /**
   * @brief  Check the no-command timeout. Called from the main loop.
-  *         When no command arrives for CMD_TIMEOUT_MS, stop all PWM so the
-  *         arm goes limp (safe: the PC has gone silent, e.g. crashed or the
-  *         COM port was closed). The next command line re-enables the servos.
   */
 void CDC_TimeoutCheck(void)
 {
@@ -533,5 +346,3 @@ void CDC_TimeoutCheck(void)
     Servo_DisableAll();
   }
 }
-
-/************************ (C) COPYRIGHT STMicroelectronics *****END OF FILE****/
