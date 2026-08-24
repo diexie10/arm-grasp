@@ -21,6 +21,9 @@
 | 状态机框架（视觉伺服版） | state_machine.py | ✅ DRY_RUN 全流程 True | 机械臂+摄像头 | 真机 SEARCH 转圈不漏检 + ALIGN 收敛 |
 | 消隙策略（单方向逼近） | trajectory.py | ✅ 实现 | 固件回显解析 | 同点 10 次偏差 <3°（实测） |
 | 伺服 PID 调参 | state_machine.py + config.py | 骨架已实现 | 机械臂+摄像头 | Kp 符号正确、无震荡、收敛 <8px；**收敛死区 ≥2° 即判到位（<2° 修正被回差吞掉，调研 2026-08-18）；FINAL_ALIGN_MAX_STEP 可能需 2.5°** |
+| J5 夹爪朝向对齐（J5=θ−J1） | state_machine.py FINAL_ALIGN | ✅ 已实现（2026-08-24）**未实测** | 机械臂+摄像头 | θ 符号/象限实测；J5 旋转方向与摄像头画面一致性确认；正方形木块可暂不启用验证 |
+| move_to 末尾 S 查询对账（B3） | trajectory.py | ✅ 已实现（2026-08-24）**未实测** | 固件联调 | 实测每次 move_to 增加的延迟（一次串口往返）；若显著拖慢伺服循环则改为每 N 次 move_to 对账一次 |
+| 架构升级：MOVE/DONE 运动执行下沉 MCU | docs/architecture/2-架构升级计划-MOVE下沉.md | 方案定稿未施工 | dev 分支 9 修复实机验证通过 | 见 ADR-2 验收标准（卡顿 500ms 臂不停 / TRANSPORT 串口命令 ≤10 条 / 浪涌错峰） |
 | 单目测距（已知尺寸 3.5cm） | 未开始 | 备选方案 | 摄像头装机械臂 | 不训练模型，公式法；仅需精确高度时启用 |
 | 电流采样力检测（ADC 读舵机电流，夹住即停） | 未开始 | 调研结论（2026-08-18） | 硬件到货 | 夹住时电流上升检测到即停，防压坏木块 |
 
@@ -45,7 +48,9 @@
 | 关节角↔舵机角 offset 映射 | config.py + arm_serial.py | 2026-08-17 Phase C | DRY_RUN 通过；offset 待实测 |
 | 忙等定时补偿（Windows sleep 粒度坑） | trajectory.py | 2026-08-17 Phase C | move_to 8.58s→理论 5.16s；DRY_RUN 不再超时 |
 | 关节限位钳位（每关节 min/max clamp） | 固件 usbd_cdc_interface.c | 2026-08-17 Phase A | 编译 0 Error；M 回显 clamp 后值 |
-| 10s 无命令超时自动停止（PWM 停→松脱） | 固件 usbd_cdc_interface.c | 2026-08-17 Phase A+B | 编译 0 Error；停发 10s 观察 |
+| 10s 无命令超时自动停止（PWM 停→松脱） | 固件 usbd_cdc_interface.c | 2026-08-17 Phase A+B；**2026-08-24 改 15s**（容纳相机预热+模型加载） | 编译 0 Error；停发超时观察 |
+| `H` 命令渐进归中（2°/20ms 斜坡，防六轴同跳浪涌） | 固件 usbd_cdc_interface.c Servo_RampStep | 2026-08-24（commit 714e2e3） | 编译 0 Error；真机 H 观察平滑性待做 |
+| 舵机通道映射统一 servo_map[6] | 固件 usbd_cdc_interface.c | 2026-08-24（commit 714e2e3） | 编译 0 Error |
 | USB 断开 → PWM 停止 + 清残留命令 | 固件 usbd_cdc_interface.c | 2026-08-17 Phase A+B | 编译 0 Error；拔 USB 观察 |
 | IWDG 看门狗 ~2s（寄存器级，PWM 前启动） | 固件 main.c | 2026-08-17 Phase A+B | 编译 0 Error；故意死循环观察复位 |
 | `H` 命令（全回中位 90° + 清急停） | 固件 usbd_cdc_interface.c | 2026-08-17 Phase A | 编译 0 Error；发 H 观察 |
