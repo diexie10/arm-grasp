@@ -87,9 +87,11 @@ class Trajectory:
             ok, msg = serial.move_joint(n, ang)
             if not ok:
                 raise TrajectoryError("joint %d: %s" % (n, msg))
-        while time.perf_counter() < deadline:
-            pass
-        return deadline + config.DT_MS / 1000.0
+        # 用实际耗时校准下一 deadline（防止串口延迟导致周期漂移）
+        now = time.perf_counter()
+        while now < deadline:
+            now = time.perf_counter()
+        return now + config.DT_MS / 1000.0
 
     def _run_plan(self, serial, pts):
         deadline = time.perf_counter()
@@ -132,5 +134,8 @@ class Trajectory:
         for i in range(6):
             if abs(to_q[i] - overshoot_q[i]) > 1e-6:
                 self.last_dir[i] = 1 if to_q[i] > overshoot_q[i] else -1
+
+        # --- 周期性 S 对账：确认实际角度与期望一致 ---
+        serial.query_state()
 
         time.sleep(config.SETTLE_MS / 1000.0)   # 到位稳定

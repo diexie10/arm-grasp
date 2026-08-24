@@ -14,7 +14,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* No-command timeout: hold position after this many ms without any command. */
-#define CMD_TIMEOUT_MS   10000U
+#define CMD_TIMEOUT_MS   15000U  /* 15s: allow for camera warmup + model load */
 
 /* Private variables ---------------------------------------------------------*/
 /* RX ring buffer (fed by UART_RxByte from USART3 ISR) */
@@ -235,6 +235,9 @@ static void Cmd_Execute(const char *line)
         if (ia < 0) { CDC_SendString("ERR\r\n"); return; }
         a = (uint16_t)ia;
         Servo_SetAll(a);
+        /* Note: echoes REQUESTED angle, not per-servo clamped values.
+         * MALL is intentionally kept simple; use individual M commands
+         * when per-joint echo accuracy matters (回显铁律). */
         sprintf(reply, "OK MALL %u\r\n", a);
         CDC_SendString(reply);
       }

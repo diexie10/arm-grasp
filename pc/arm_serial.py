@@ -89,13 +89,14 @@ class ArmSerial:
 
         注意：move_joint 已做关节角→舵机角转换，这里绝不能再 +OFFSET（双重转换 bug）。
         clamp 用固件的 joint_min/max（舵机角域），与真实固件行为一致。
+        限位表从 config 单一来源导出（消除与固件的重复维护）。
         """
         m = re.match(r"^M(\d)\s+([-\d.]+)$", cmd)
         if m:
             n, a = int(m.group(1)), float(m.group(2))
-            # 固件限位表（usbd_cdc_interface.c joint_min/max，舵机角域）
-            fw_min = [0, 30, 10, 0, 45, 30]
-            fw_max = [180, 180, 150, 180, 135, 120]
+            # 从 config 关节限位 + 偏移量导出舵机域限位（单一真源）
+            fw_min = [config.JOINT_MIN[i] + config.JOINT_OFFSET[i] for i in range(6)]
+            fw_max = [config.JOINT_MAX[i] + config.JOINT_OFFSET[i] for i in range(6)]
             servo = max(float(fw_min[n - 1]), min(float(fw_max[n - 1]), a))
             return "OK M%d %.1f" % (n, servo)
         if cmd.startswith("MALL"):
@@ -145,7 +146,8 @@ class ArmSerial:
             self.last_warning = msg
             return False, msg
         servo = angle + config.JOINT_OFFSET[n - 1]      # 关节角 → 舵机角
-        resp = self._send("M%d %.1f" % (n, servo))
+        servo_int = int(round(servo))                    # 量化为整数（固件 %d 解析）
+        resp = self._send("M%d %d" % (n, servo_int))
         if resp is None:
             return False, "TIMEOUT: no response from MCU"
         if resp.startswith("ERR"):

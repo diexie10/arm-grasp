@@ -112,12 +112,13 @@ class StateMachine:
         if not config.SPIRAL_ENABLED:
             return False
         self._set_state("SPIRAL")
+        t0_local = time.monotonic()             # 螺旋独立计时（不占 DESCEND 预算）
         x0, y0, z0 = kinematics.fk(self.serial.joint_state)
         print("[SM] SPIRAL: 起点 (%.0f, %.0f, %.0f) mm，%d 点 / %d 圈 / R=%.0fmm"
               % (x0, y0, z0, config.SPIRAL_POINTS, config.SPIRAL_TURNS,
                  config.SPIRAL_R_MAX))
         for k in range(1, config.SPIRAL_POINTS + 1):
-            if self._timeout(t0, "SPIRAL"):
+            if self._timeout(t0_local, "SPIRAL"):
                 return False
             frac = float(k) / config.SPIRAL_POINTS
             r = config.SPIRAL_R_MAX * frac
@@ -200,6 +201,7 @@ class StateMachine:
             q[0] += dq0
             q[1] += dq12
             q[2] += dq12
+            q[3] = 90.0 - q[1] - q[2]          # 保持末端竖直（J4 = 90 - J2 - J3）
             # 限位保护：伺服增量不得推出关节限位（超限 = 目标不可达，转 ERROR）
             for i in range(6):
                 if q[i] < config.JOINT_MIN[i] or q[i] > config.JOINT_MAX[i]:
@@ -384,6 +386,8 @@ class StateMachine:
                     q[0] += dq0
                     q[1] += dq12
                     q[2] += dq12
+                    q[3] = 90.0 - q[1] - q[2]      # 保持末端竖直
+                    q[4] = theta_deg - q[0]          # J5 对齐夹爪朝向（θ − J1）
                     for i in range(6):
                         if q[i] < config.JOINT_MIN[i] or q[i] > config.JOINT_MAX[i]:
                             return self._to_error(
