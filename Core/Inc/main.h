@@ -62,15 +62,15 @@ void Error_Handler(void);
 /* Servo PWM: 50Hz (20ms), pulse 0.5ms..2.5ms -> 0..270 deg
  * (servos are 270-degree type, verified by user 2026-08-20)
  * Timer clock 1MHz (PSC=71), ARR=19999 -> 20ms period
- * Compare value = 500 + angle * 2000 / 270
+ * Compare value = 500 + angle * 2000 / 180
  */
 #define SERVO_MIN_PULSE    500U   /* 0.5ms -> 0 deg   */
 #define SERVO_MAX_PULSE    2500U  /* 2.5ms -> 270 deg */
-#define SERVO_MAX_ANGLE    270U   /* 270-degree servos */
+#define SERVO_MAX_ANGLE    180U   /* Scaled for ~250-deg clone MG996R (calibrated 2026-08-23) */
 /* Neutral (home) pulse derived from the SAME mapping Servo_SetAngle uses,
  * so the timer reset value and command PWM share one definition of "90 deg".
- * = 500 + 90*2000/270 = 1166 us (= 89.9 deg physical on a 270-deg servo).
- * NEVER hardcode 1500 here: on a 270-deg servo that is 135 deg, not home. */
+ * = 500 + 90*2000/180 = 1500 us (= 90 deg physical on calibrated servo).
+ * NEVER hardcode 1500 here: calibration must match SERVO_MAX_ANGLE. */
 #define SERVO_HOME_PULSE   (SERVO_MIN_PULSE + (90U * (SERVO_MAX_PULSE - SERVO_MIN_PULSE)) / SERVO_MAX_ANGLE)
 
 /* IR sensor GPIOs (active low: 0 = beam broken / object present) */

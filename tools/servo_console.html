@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Arm-Grasp 舵机控制台</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, 'Segoe UI', sans-serif; background: #1a1a2e; color: #e0e0e0; padding: 20px; }
+  h1 { text-align: center; margin-bottom: 20px; color: #00d4ff; font-size: 1.5em; }
+  .connection { text-align: center; margin-bottom: 20px; }
+  .connection button { padding: 10px 24px; border: none; border-radius: 6px; font-size: 1em; cursor: pointer; margin: 0 6px; }
+  #btnConnect { background: #00d4ff; color: #1a1a2e; font-weight: bold; }
+  #btnConnect.connected { background: #ff4757; }
+  #status { margin-top: 8px; font-size: 0.9em; color: #aaa; }
+  .servos { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; max-width: 900px; margin: 0 auto; }
+  .servo-card { background: #16213e; border-radius: 10px; padding: 16px; border: 1px solid #0f3460; }
+  .servo-card h3 { color: #00d4ff; margin-bottom: 10px; font-size: 1em; }
+  .slider-row { display: flex; align-items: center; gap: 10px; }
+  .slider-row input[type=range] { flex: 1; accent-color: #00d4ff; height: 6px; }
+  .slider-row .val { min-width: 48px; text-align: right; font-family: monospace; font-size: 1.1em; color: #00d4ff; }
+  .slider-row button { padding: 6px 12px; border: 1px solid #0f3460; background: #0f3460; color: #e0e0e0; border-radius: 4px; cursor: pointer; font-size: 0.85em; }
+  .slider-row button:hover { background: #1a4a8a; }
+  .actions { text-align: center; margin-top: 20px; }
+  .actions button { padding: 12px 28px; border: none; border-radius: 6px; font-size: 1em; cursor: pointer; margin: 0 6px; font-weight: bold; }
+  #btnHome { background: #2ed573; color: #1a1a2e; }
+  #btnStop { background: #ff4757; color: #fff; }
+  #btnRefresh { background: #ffa502; color: #1a1a2e; }
+  #log { max-width: 900px; margin: 20px auto 0; background: #0d1117; border-radius: 8px; padding: 12px; font-family: monospace; font-size: 0.85em; max-height: 200px; overflow-y: auto; color: #8b949e; }
+  #log div.sent { color: #58a6ff; }
+  #log div.recv { color: #3fb950; }
+</style>
+</head>
+<body>
+<h1>🦾 Arm-Grasp 舵机控制台</h1>
+
+<div class="connection">
+  <button id="btnConnect" onclick="toggleConnect()">连接 CH340</button>
+  <button onclick="sendCmd('S')">查询状态 (S)</button>
+  <div id="status">未连接</div>
+</div>
+
+<div class="servos" id="servos"></div>
+
+<div class="actions">
+  <button id="btnHome" onclick="sendHome()">归中 (H)</button>
+  <button id="btnStop" onclick="sendCmd('E')">急停 (E)</button>
+  <button onclick="sendCmd('I')">读红外 (I)</button>
+</div>
+
+<div id="log"></div>
+
+<script>
+const SERVO_NAMES = ['J1 底座', 'J2 大臂', 'J3 小臂', 'J4 腕俯仰', 'J5 腕旋转', 'J6 夹爪'];
+const HOME_ANGLES = [90, 135, 60, 75, 90, 90];
+let port = null;
+let reader = null;
+let writer = null;
+let connected = false;
+let readBuffer = '';
+
+// Build servo cards
+const container = document.getElementById('servos');
+for (let i = 0; i < 6; i++) {
+  const card = document.createElement('div');
+  card.className = 'servo-card';
+  card.innerHTML = `
+    <h3>M${i+1} ${SERVO_NAMES[i]}</h3>
+    <div class="slider-row">
+      <span style="font-size:0.8em;color:#666">0°</span>
+      <input type="range" id="s${i}" min="0" max="180" value="${HOME_ANGLES[i]}" oninput="updateVal(${i})">
+      <span style="font-size:0.8em;color:#666">180°</span>
+      <span class="val" id="v${i}">${HOME_ANGLES[i]}°</span>
+      <button onclick="sendServo(${i})">发送</button>
+    </div>`;
+  container.appendChild(card);
+}
+
+function updateVal(i) {
+  document.getElementById('v' + i).textContent = document.getElementById('s' + i).value + '°';
+}
+
+async function toggleConnect() {
+  if (connected) {
+    if (reader) { reader.cancel(); reader = null; }
+    if (port) { port.close(); port = null; }
+    connected = false;
+    document.getElementById('btnConnect').textContent = '连接 CH340';
+    document.getElementById('btnConnect').classList.remove('connected');
+    document.getElementById('status').textContent = '已断开';
+    return;
+  }
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    const decoder = new TextDecoderStream();
+    reader = port.readable.pipeThrough(decoder).getReader();
+    writer = port.writable.getWriter();
+    connected = true;
+    document.getElementById('btnConnect').textContent = '断开';
+    document.getElementById('btnConnect').classList.add('connected');
+    document.getElementById('status').textContent = '已连接';
+    readLoop();
+  } catch (e) {
+    document.getElementById('status').textContent = '连接失败: ' + e.message;
+  }
+}
+
+async function readLoop() {
+  while (connected) {
+    try {
+      const { value, done } = await reader.read();
+      if (done) break;
+      readBuffer += value;
+      // Process complete lines
+      let idx;
+      while ((idx = readBuffer.indexOf('\n')) !== -1) {
+        const line = readBuffer.slice(0, idx).trim();
+        readBuffer = readBuffer.slice(idx + 1);
+        if (line) log(line, 'recv');
+      }
+    } catch (e) {
+      if (connected) log('读取错误: ' + e.message, 'recv');
+      break;
+    }
+  }
+}
+
+async function sendCmd(cmd) {
+  if (!connected) { log('未连接！', 'sent'); return; }
+  try {
+    const data = new TextEncoder().encode(cmd + '\n');
+    await writer.write(data);
+    log('> ' + cmd, 'sent');
+  } catch (e) {
+    log('发送失败: ' + e.message, 'sent');
+  }
+}
+
+function sendServo(i) {
+  const angle = document.getElementById('s' + i).value;
+  sendCmd(`M${i+1} ${angle}`);
+}
+
+function sendHome() {
+  sendCmd('H');
+  // Reset sliders to home values
+  for (let i = 0; i < 6; i++) {
+    document.getElementById('s' + i).value = HOME_ANGLES[i];
+    updateVal(i);
+  }
+}
+
+function log(text, cls) {
+  const el = document.getElementById('log');
+  const div = document.createElement('div');
+  div.className = cls;
+  div.textContent = text;
+  el.appendChild(div);
+  el.scrollTop = el.scrollHeight;
+  // Keep max 100 lines
+  while (el.children.length > 100) el.removeChild(el.firstChild);
+}
+
+// Keyboard shortcuts
+document.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT') return;
+  switch(e.key) {
+    case 'h': case 'H': sendHome(); break;
+    case 'e': case 'E': sendCmd('E'); break;
+    case 's': case 'S': sendCmd('S'); break;
+  }
+});
+</script>
+</body>
+</html>
