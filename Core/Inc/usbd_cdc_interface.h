@@ -34,6 +34,9 @@ void CDC_ProcessRx(void);
 /* Called from main loop: check no-command timeout (auto-hold). */
 void CDC_TimeoutCheck(void);
 
+/* Called from main loop: gradual servo ramp toward targets (H command). */
+void Servo_RampStep(void);
+
 #ifdef __cplusplus
 }
 #endif

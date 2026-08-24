@@ -38,6 +38,28 @@ static volatile uint16_t servo_angle[6] = {90U, 90U, 90U, 90U, 90U, 90U};
  * Cleared by Servo_DisableAll (E-stop / timeout). */
 static uint8_t servo_enabled[6] = {0U, 0U, 0U, 0U, 0U, 0U};
 
+/* Timer handles (defined in main.c). */
+extern TIM_HandleTypeDef htim1;
+extern TIM_HandleTypeDef htim2;
+
+/* Channel → timer/channel mapping (single source of truth). */
+typedef struct { TIM_HandleTypeDef *tim; uint32_t chan; } ServoChannel;
+static const ServoChannel servo_map[6] = {
+  {&htim1, TIM_CHANNEL_1},  /* ch0 = J1 = PA8 */
+  {&htim1, TIM_CHANNEL_2},  /* ch1 = J2 = PA9 */
+  {&htim1, TIM_CHANNEL_3},  /* ch2 = J3 = PA10 */
+  {&htim2, TIM_CHANNEL_1},  /* ch3 = J4 = PA0 */
+  {&htim2, TIM_CHANNEL_2},  /* ch4 = J5 = PA1 */
+  {&htim2, TIM_CHANNEL_3},  /* ch5 = J6 = PA2 */
+};
+
+/* H-command ramp state: servos gradually move toward target angles. */
+static volatile uint16_t servo_target[6] = {90U, 90U, 90U, 90U, 90U, 90U};
+static uint8_t ramp_active = 0U;
+static uint32_t ramp_tick  = 0U;
+#define RAMP_STEP_MS  20U   /* move every 20 ms (matches 50 Hz servo refresh) */
+#define RAMP_STEP_DEG  2U   /* 2 deg per step ≈ 100 deg/s */
+
 /* Joint angle limits (servo degrees, 0-270 = 0.5-2.5ms PWM on 270-deg servos).
  * Conservative 0-180 band until stage-6 measurement (see docs). */
 static const uint16_t joint_min[6] = {0U, 30U, 10U, 0U, 45U, 30U};
@@ -55,10 +77,6 @@ static void Servo_DisableAll(void);
 static uint8_t HexNibble(char c);
 static uint8_t Cmd_CheckChecksum(char *line);
 static void Cmd_Execute(const char *line);
-
-/* Exported variables --------------------------------------------------------*/
-extern TIM_HandleTypeDef htim1;
-extern TIM_HandleTypeDef htim2;
 
 /**
   * @brief  Called from the USART3 ISR when a byte arrives. Pushes into ring.
@@ -106,8 +124,6 @@ int8_t CDC_SendString(const char *str)
 static void Servo_SetAngle(uint8_t ch, uint16_t angle)
 {
   uint16_t cmp;
-  TIM_HandleTypeDef *tim;
-  uint32_t chan;
 
   if (ch >= 6U) return;
 
@@ -115,29 +131,18 @@ static void Servo_SetAngle(uint8_t ch, uint16_t angle)
   if (angle < joint_min[ch]) { angle = joint_min[ch]; }
   if (angle > joint_max[ch]) { angle = joint_max[ch]; }
 
-  /* Angle -> pulse width -> compare value (270-deg servos) */
+  /* Angle -> pulse width -> compare value */
   cmp = SERVO_MIN_PULSE +
         ((uint32_t)angle * (SERVO_MAX_PULSE - SERVO_MIN_PULSE)) / SERVO_MAX_ANGLE;
 
-  /* Select timer/channel */
-  switch (ch)
-  {
-    case 0: tim = &htim1; chan = TIM_CHANNEL_1; break;
-    case 1: tim = &htim1; chan = TIM_CHANNEL_2; break;
-    case 2: tim = &htim1; chan = TIM_CHANNEL_3; break;
-    case 3: tim = &htim2; chan = TIM_CHANNEL_1; break;
-    case 4: tim = &htim2; chan = TIM_CHANNEL_2; break;
-    default: tim = &htim2; chan = TIM_CHANNEL_3; break;
-  }
-
-  __HAL_TIM_SET_COMPARE(tim, chan, cmp);
+  __HAL_TIM_SET_COMPARE(servo_map[ch].tim, servo_map[ch].chan, cmp);
   servo_angle[ch] = angle;
 
   /* Lazy start: only enable PWM on first command for this channel. */
   if ((servo_enabled[ch] == 0U) && (estop_active == 0U))
   {
     servo_enabled[ch] = 1U;
-    HAL_TIM_PWM_Start(tim, chan);
+    HAL_TIM_PWM_Start(servo_map[ch].tim, servo_map[ch].chan);
   }
 }
 
@@ -161,13 +166,11 @@ static void Servo_SetAll(uint16_t angle)
 static void Servo_DisableAll(void)
 {
   uint8_t i;
-  HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_2);
-  HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_3);
-  HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2);
-  HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_3);
-  for (i = 0U; i < 6U; i++) { servo_enabled[i] = 0U; }
+  for (i = 0U; i < 6U; i++)
+  {
+    HAL_TIM_PWM_Stop(servo_map[i].tim, servo_map[i].chan);
+    servo_enabled[i] = 0U;
+  }
 }
 
 /**
@@ -276,8 +279,10 @@ static void Cmd_Execute(const char *line)
     estop_active = 0U;
     for (hi = 0U; hi < 6U; hi++)
     {
-      Servo_SetAngle(hi, home_servo[hi]);
+      servo_target[hi] = home_servo[hi];
     }
+    ramp_active = 1U;
+    ramp_tick = HAL_GetTick();
     CDC_SendString("OK H\r\n");
   }
   else if ((line[0] == 'E') || (line[0] == 'e'))
@@ -345,4 +350,36 @@ void CDC_TimeoutCheck(void)
     timeout_active = 1U;
     Servo_DisableAll();
   }
+}
+
+/**
+  * @brief  Gradual ramp: move each servo 1 step toward its target angle.
+  *         Called from main loop. Non-blocking; paces via HAL_GetTick().
+  */
+void Servo_RampStep(void)
+{
+  uint8_t i, all_done = 1U;
+
+  if (ramp_active == 0U) return;
+  if ((HAL_GetTick() - ramp_tick) < RAMP_STEP_MS) return;
+  ramp_tick = HAL_GetTick();
+
+  for (i = 0U; i < 6U; i++)
+  {
+    if (servo_angle[i] < servo_target[i])
+    {
+      uint16_t next = servo_angle[i] + RAMP_STEP_DEG;
+      if (next > servo_target[i]) next = servo_target[i];
+      Servo_SetAngle(i, next);
+      all_done = 0U;
+    }
+    else if (servo_angle[i] > servo_target[i])
+    {
+      uint16_t next = servo_angle[i] - RAMP_STEP_DEG;
+      if (next < servo_target[i]) next = servo_target[i];
+      Servo_SetAngle(i, next);
+      all_done = 0U;
+    }
+  }
+  if (all_done != 0U) { ramp_active = 0U; }
 }

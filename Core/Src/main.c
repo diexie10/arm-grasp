@@ -127,6 +127,8 @@ int main(void)
   {
     /* Process incoming USART3 commands */
     CDC_ProcessRx();
+    /* Gradual servo ramp (H command smooth movement). */
+    Servo_RampStep();
     /* No-command timeout: hold position if the PC went silent. */
     CDC_TimeoutCheck();
     /* Feed the watchdog. */
