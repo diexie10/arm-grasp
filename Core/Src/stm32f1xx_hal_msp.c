@@ -113,7 +113,25 @@ void HAL_TIM_Base_MspInit(TIM_HandleTypeDef* htim_base)
 
   /* USER CODE END TIM2_MspInit 1 */
   }
+}
 
+/**
+* @brief TIM_PWM MSP Initialization
+* HAL_TIM_PWM_Init() calls THIS (not HAL_TIM_Base_MspInit).
+* Without this override, the __weak default is empty → TIM clock never enabled.
+* @param htim: TIM handle pointer
+* @retval None
+*/
+void HAL_TIM_PWM_MspInit(TIM_HandleTypeDef* htim)
+{
+  if(htim->Instance==TIM1)
+  {
+    __HAL_RCC_TIM1_CLK_ENABLE();
+  }
+  else if(htim->Instance==TIM2)
+  {
+    __HAL_RCC_TIM2_CLK_ENABLE();
+  }
 }
 
 void HAL_TIM_MspPostInit(TIM_HandleTypeDef* htim)

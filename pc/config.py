@@ -6,8 +6,8 @@
 """
 
 # ===================== 串口 =====================
-COM_PORT = "COM7"            # 实际端口以设备管理器为准（CH340/USB-TTL，接板子 USART3：TX→PB11 RX→PB10）
-BAUDRATE = 115200            # USART3 波特率（固件 BRR=0x1388 @ PCLK1=36MHz，8N1）
+COM_PORT = "COM8"            # 实际端口以设备管理器为准（CH340/USB-TTL，接板子 USART3：TX→PB11 RX→PB10）。2026-08-23 实测 COM8
+BAUDRATE = 115200            # USART3 波特率（固件 BRR=0x138 @ PCLK1=36MHz，USARTDIV=19.53，8N1）
 SERIAL_TIMEOUT = 0.1         # 秒 —— 必须设，否则 readline 永久阻塞（KNOWN_TRAPS #9）
 RESP_TIMEOUT = 2.0           # 秒，等待应答超时
 CMD_INTERVAL = 0.02          # 秒，命令最小间隔
