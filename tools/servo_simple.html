@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>舵机控制</title>
+<style>
+  body { font-family: monospace; background: #111; color: #eee; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+  .bar { display: flex; align-items: center; gap: 16px; margin: 10px 0; }
+  input[type=range] { width: 400px; accent-color: #0cf; }
+  .val { font-size: 2em; color: #0cf; min-width: 80px; text-align: right; }
+  .pw { font-size: 1em; color: #666; }
+  button { padding: 10px 30px; font-size: 1.1em; border: none; border-radius: 6px; cursor: pointer; }
+  #conn { background: #0cf; color: #111; font-weight: bold; }
+  #conn.on { background: #f44; }
+  #send { background: #0c6; color: #fff; }
+  #st { color: #666; margin-top: 8px; font-size: 0.9em; }
+</style>
+</head>
+<body>
+<div class="bar">
+  <button id="conn" onclick="toggle()">连接</button>
+</div>
+<div class="bar">
+  <input type=range id="slider" min=0 max=270 value=90 step=1 oninput="show()">
+  <span class="val" id="val">90°</span>
+</div>
+<div class="bar">
+  <button id="send" onclick="go()">发送</button>
+  <span class="pw" id="pw">500~2500µs</span>
+</div>
+<div id="st">未连接</div>
+
+<script>
+let port, writer, reader, connected = false;
+const MIN_P = 500, MAX_P = 2500;
+
+function show() {
+  const a = +document.getElementById('slider').value;
+  document.getElementById('val').textContent = a + '°';
+  const p = Math.round(MIN_P + a * (MAX_P - MIN_P) / 180);
+  document.getElementById('pw').textContent = p + 'µs';
+}
+
+async function toggle() {
+  if (connected) { reader?.cancel(); port?.close(); connected = false;
+    document.getElementById('conn').textContent = '连接';
+    document.getElementById('conn').classList.remove('on');
+    document.getElementById('st').textContent = '已断开'; return; }
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    const dec = new TextDecoderStream();
+    reader = port.readable.pipeThrough(dec).getReader();
+    writer = port.writable.getWriter();
+    connected = true;
+    document.getElementById('conn').textContent = '断开';
+    document.getElementById('conn').classList.add('on');
+    document.getElementById('st').textContent = '已连接';
+    readLoop();
+  } catch (e) { document.getElementById('st').textContent = '失败: ' + e.message; }
+}
+
+async function readLoop() {
+  while (connected) {
+    try {
+      const { value, done } = await reader.read();
+      if (done) break;
+      document.getElementById('st').textContent = value.trim();
+    } catch (e) { break; }
+  }
+}
+
+async function go() {
+  if (!connected) return;
+  const a = document.getElementById('slider').value;
+  await writer.write(new TextEncoder().encode('M1 ' + a + '\n'));
+}
+
+// ← → 微调
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  const s = document.getElementById('slider');
+  if (e.key === 'ArrowLeft') { s.value = Math.max(0, +s.value - 1); show(); }
+  if (e.key === 'ArrowRight') { s.value = Math.min(270, +s.value + 1); show(); }
+  if (e.key === ' ') { e.preventDefault(); go(); }
+});
+
+show();
+</script>
+</body>
+</html>
