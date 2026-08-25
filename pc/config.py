@@ -53,7 +53,10 @@ GRIP_CLOSE = 40.0            # 夹爪闭合角度（J6 舵机角），抓取木�
 # ===================== 轨迹 =====================
 MAX_VEL = 30.0               # °/s（MG996 极限 ~60°/s 的 50%，推测值待调）
 MAX_ACC = 15.0               # °/s²（推测值待调）
-DT_MS = 20                   # 插补周期 ms（对齐舵机 50Hz 刷新）
+DT_MS = 20                   # 插补周期 ms（对齐舵机 50Hz 刷新；ADR-3 后仅估算用）
+DONE_POLL_MS = 50            # ADR-3：G 命令后轮询 Q 的间隔 ms
+DONE_TIMEOUT_FACTOR = 2.0    # DONE 超时 = 预估运动时长 × 该系数
+DONE_TIMEOUT_EXTRA_S = 2.0   # DONE 超时固定余量 s
 OVERSHOOT = 15.0             # 消隙过冲量 °（> 最大虚位 8°，推测值待实测）
 SETTLE_MS = 300              # 到位稳定时间
 GRIP_WAIT_MS = 200           # 夹爪闭合后等待，再抬升

@@ -5,6 +5,37 @@
 
 ---
 
+## 2026-08-25（ADR-3 施工落地：梯形轨迹固件 + waypoint 上位机）
+
+### 本轮做了什么
+1. **昨夜遗留清理**：发现被调研打断的半成品改动（`ramp_active` 删定义但 3 处引用，编译必挂）→ 回滚，教训入档"中断实现必须立即 stash/revert"
+2. **H 斜坡 + 15s 超时实机验证通过**（用户单舵机测试："没什么问题了"）
+3. **ADR-3 固件施工**（F1-F7 全部完成，编译 0E0W）：
+   - F1 `ServoAxis{target,current:float,vel:float,settled,stagger}` 替换 servo_angle/servo_target 双数组
+   - F2 G 命令（六轴批量目标）+ 错峰 i×3 tick + 回显 clamp 目标
+   - F3 RampStep 梯形重写：v²/2a 自适应减速窗、爬行下限保收敛、硬上限 15s 强制完成
+   - F4 Q 查询（BUSY/DONE；DONE=全轴连续 3 tick <0.01°，不含稳定等待）
+   - F5 超时门控：motion_done==0 抑制空闲超时（PC 死于途中臂走完轨迹）
+   - F6 M 四件套立即覆盖（target+current+vel+settled）；MALL 同语义循环
+   - F7 H 分急停/正常两态：急停后复位 HOME 态不使能 PWM（交 PC soft_start）；正常 H 保留梯形滑回
+4. **ADR-3 上位机施工**（P1/P2/P5 完成，py_compile+冒烟通过）：
+   - arm_serial.move_waypoint：G 发送+回显铁律校验+Q 轮询 DONE（超时=位移/MAX_VEL×2+2s）
+   - trajectory.move_to 改 waypoint 模式：删 20ms 插补流（_exec_point/_run_plan 删除），消隙过冲=先发过冲点再发目标点
+   - config 增 DONE_POLL_MS/FACTOR/EXTRA；S 查询改报斜坡 current
+5. **冒烟测试**（DRY_RUN）：正向移动/反向过冲路径/限位拒绝/E-H 恢复 全部通过
+
+### 验证
+- Keil 编译 0 Error 0 Warning
+- py_compile 4 文件通过；DRY_RUN 冒烟 4 场景通过
+- 未验证（等硬件）：真实 G/Q 时序、多轴错峰浪涌、DONE 超时路径
+
+### 遗留
+- 烧录后 J1 单轴验证：G 滑行 / Q BUSY→DONE / M 瞬跳对比 / E-H 后软直到 soft_start
+- 多轴项（错峰浪涌、母线塌压）等线材到货补验
+- servo_console.html 无 G/Q 按钮——单轴测试用串口助手发裸命令
+
+---
+
 ## 2026-08-24b（ADR-3 定稿：梯形轨迹下沉 MCU，三轮对抗审查）
 
 ### 本轮做了什么

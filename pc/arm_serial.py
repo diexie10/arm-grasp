@@ -2,11 +2,13 @@
 """arm_serial.py — 与 STM32 固件的 USART3 串口通信层。
 
 协议（固件 usbd_cdc_interface.c，CRLF 结尾）：
-    M<n> <angle>  → OK M<n> <clamped_angle>  （回显 clamp 后的实际角度！）
+    M<n> <angle>  → OK M<n> <clamped_angle>  （单轴立即覆盖，四件套语义）
     MALL <a1..a6> → OK MALL ...
-    S             → OK S1=<a1> ... S6=<a6>    （当前关节状态）
+    G <a1..a6>    → OK G <clamped a1..a6>    （批量目标，MCU 梯形自主执行）
+    Q             → DONE / BUSY               （运动完成查询，50ms 轮询）
+    S             → OK S1=<a1> ... S6=<a6>    （当前斜坡位置）
     I             → OK IR1=<0|1> IR2=<0|1>    （遮挡=0）
-    H             → OK H（全回中位 + 清急停）
+    H             → OK H（清急停+复位 HOME 态；急停后不使能 PWM，交 soft_start）
     E             → OK E（急停：停全部 PWM，拒绝 M 直到 H）
 
 校验和（借鉴 Panthera-HT 双 CRC，文本协议简化版）：
@@ -114,6 +116,17 @@ class ArmSerial:
         if cmd == "E":
             self.estop_active = True
             return "OK E"
+        m_g = re.match(r"^G\s+((?:-?\d+\s+){5}-?\d+)$", cmd)
+        if m_g:
+            vals = [int(x) for x in m_g.group(1).split()]
+            clamped = []
+            for i, v in enumerate(vals):
+                lo = config.JOINT_MIN[i] + config.JOINT_OFFSET[i]
+                hi = config.JOINT_MAX[i] + config.JOINT_OFFSET[i]
+                clamped.append(int(round(max(lo, min(hi, v)))))
+            return "OK G " + " ".join(str(x) for x in clamped)
+        if cmd == "Q":
+            return "DONE"
         return "ERR unknown"
 
     # ---------- 命令 ----------
@@ -180,6 +193,53 @@ class ArmSerial:
             servos[int(idx_str) - 1] = float(val)
         self.joint_state = from_servo(servos)
         return True
+
+    def move_waypoint(self, q):
+        """ADR-3 P2：发 G 批量目标（六轴关节角），轮询 Q 直到 DONE。
+
+        PC 不再逐 20ms 刷点——MCU 自主梯形执行，PC 只发拐点。
+        超时 = 预估时长(最大关节位移/MAX_VEL) × FACTOR + EXTRA。
+        回显铁律：校验 G 回显的六个 clamp 后目标值。
+        返回 (True, "ok") 或 (False, 原因)。
+        """
+        for i in range(6):
+            if q[i] < config.JOINT_MIN[i] - config.LIMIT_EPS or \
+               q[i] > config.JOINT_MAX[i] + config.LIMIT_EPS:
+                return False, "joint %d out of range %.1f" % (i + 1, q[i])
+        prev = list(self.joint_state)
+        dmax = max(abs(q[i] - prev[i]) for i in range(6))
+        timeout_s = (dmax / config.MAX_VEL) * config.DONE_TIMEOUT_FACTOR \
+            + config.DONE_TIMEOUT_EXTRA_S
+
+        servos = [int(round(q[i] + config.JOINT_OFFSET[i])) for i in range(6)]
+        resp = self._send("G %d %d %d %d %d %d" % tuple(servos))
+        if resp is None:
+            return False, "TIMEOUT: no response from MCU"
+        if resp.startswith("ERR"):
+            return False, resp
+        m = re.match(r"^OK G ((?:\d+\s+){5}\d+)", resp or "")
+        if not m:
+            return False, "BAD_ECHO: %r (firmware protocol mismatch?)" % resp
+        echoed = [int(x) for x in m.group(1).split()]
+        # 固件 clamp 后应与本地预期一致（±1° 容差防取整边界）
+        for i in range(6):
+            expect = max(config.JOINT_MIN[i] + config.JOINT_OFFSET[i],
+                         min(config.JOINT_MAX[i] + config.JOINT_OFFSET[i],
+                             servos[i]))
+            if abs(echoed[i] - expect) > 1:
+                return False, ("BAD_ECHO: axis %d echo %d != expect %d"
+                               % (i + 1, echoed[i], expect))
+        # 虚拟状态 = 回显目标（DONE 后即物理到达）
+        self.joint_state = [echoed[i] - config.JOINT_OFFSET[i]
+                            for i in range(6)]
+
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            r = self._send("Q")
+            if r is not None and "DONE" in r:
+                return True, "ok"
+            time.sleep(config.DONE_POLL_MS / 1000.0)
+        return False, "DONE_TIMEOUT after %.1fs" % timeout_s
 
     def query_ir(self):
         """发 I。返回 (ir1_blocked, ir2_blocked) 或 (None, None) 失败。"""

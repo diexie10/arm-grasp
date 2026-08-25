@@ -26,11 +26,6 @@ static uint8_t rx_ring[CDC_RX_BUFFER_SIZE];
 static char cmd_line[64];
 static uint16_t cmd_len = 0U;
 
-/* Servo angle storage (degrees, clamped to joint limits).
- * Written by the main loop only (Servo_SetAngle via CDC_ProcessRx).
- * 16-bit aligned accesses are atomic on Cortex-M3. */
-static volatile uint16_t servo_angle[6] = {90U, 90U, 90U, 90U, 90U, 90U};
-
 /* Per-channel PWM enable flags. A channel is started LAZILY by its first
  * Servo_SetAngle call, so power-up and timeout recovery draw zero current
  * until the PC explicitly commands that servo - this is what makes the
@@ -53,12 +48,37 @@ static const ServoChannel servo_map[6] = {
   {&htim2, TIM_CHANNEL_3},  /* ch5 = J6 = PA2 */
 };
 
-/* H-command ramp state: servos gradually move toward target angles. */
-static volatile uint16_t servo_target[6] = {90U, 90U, 90U, 90U, 90U, 90U};
-static uint8_t ramp_active = 0U;
-static uint32_t ramp_tick  = 0U;
-#define RAMP_STEP_MS  20U   /* move every 20 ms (matches 50 Hz servo refresh) */
-#define RAMP_STEP_DEG  2U   /* 2 deg per step ≈ 100 deg/s */
+/* Universal motion executor (ADR-3). G/M/H commands manipulate per-axis
+ * state; Servo_RampStep drives trapezoidal motion toward targets.
+ * Main-loop-only access (ISR never touches), so no volatile needed.
+ * Constants carry multiply-back verification - unit-conversion incidents
+ * happened twice in review, so every derived value shows its check. */
+typedef struct {
+  uint16_t target;   /* goal angle, servo domain, clamped to joint limits */
+  float    current;  /* current angle, deg. Float is mandatory: integer vel
+                       made the trapezoid collapse into velocity steps */
+  float    vel;      /* signed velocity, deg/tick */
+  uint8_t  settled;  /* consecutive at-target ticks (saturating at 255) */
+  uint8_t  stagger;  /* start-delay ticks; G staggers axis i by i*STAGGER_TICKS */
+} ServoAxis;
+static ServoAxis axis[6] = {
+  {90U, 90.0f, 0.0f, 0U, 0U}, {90U, 90.0f, 0.0f, 0U, 0U},
+  {90U, 90.0f, 0.0f, 0U, 0U}, {90U, 90.0f, 0.0f, 0U, 0U},
+  {90U, 90.0f, 0.0f, 0U, 0U}, {90U, 90.0f, 0.0f, 0U, 0U},
+};
+
+#define RAMP_TICK_MS       20U    /* x1 = 50 Hz tick, matches servo refresh */
+#define MAX_VEL          0.6f     /* x50   = 30 deg/s  (50% of MG996 60 deg/s) */
+#define ACC_PER_TICK     0.006f   /* x2500 = 15 deg/s^2 (50% of max vel)     */
+#define REACH_TOL         0.01f   /* arrival threshold, deg                  */
+#define SETTLE_TICKS         3U   /* consecutive at-target ticks before DONE */
+#define STAGGER_TICKS        3U   /* axis i starts i*3 ticks later = 60 ms   */
+#define MOTION_HARD_CAP_MS 15000U /* force-complete window after G; guarantees
+                                   the idle-timeout suppression cannot last */
+
+static uint8_t  motion_done     = 1U;  /* Q query reply state; only G clears */
+static uint32_t move_start_tick = 0U;  /* HAL tick when G was accepted       */
+static uint32_t ramp_tick       = 0U;  /* RampStep pacing                    */
 
 /* Joint angle limits (servo degrees, 0-270 = 0.5-2.5ms PWM on 270-deg servos).
  * Conservative 0-180 band until stage-6 measurement (see docs). */
@@ -127,16 +147,12 @@ static void Servo_SetAngle(uint8_t ch, uint16_t angle)
 
   if (ch >= 6U) return;
 
-  /* Clamp to joint limits */
-  if (angle < joint_min[ch]) { angle = joint_min[ch]; }
-  if (angle > joint_max[ch]) { angle = joint_max[ch]; }
-
-  /* Angle -> pulse width -> compare value */
+  /* Angle -> pulse width -> compare value. Callers own clamping and the
+   * axis[] bookkeeping; this is pure PWM output + lazy start. */
   cmp = SERVO_MIN_PULSE +
         ((uint32_t)angle * (SERVO_MAX_PULSE - SERVO_MIN_PULSE)) / SERVO_MAX_ANGLE;
 
   __HAL_TIM_SET_COMPARE(servo_map[ch].tim, servo_map[ch].chan, cmp);
-  servo_angle[ch] = angle;
 
   /* Lazy start: only enable PWM on first command for this channel. */
   if ((servo_enabled[ch] == 0U) && (estop_active == 0U))
@@ -156,7 +172,15 @@ static void Servo_SetAll(uint16_t angle)
   uint8_t i;
   for (i = 0U; i < 6U; i++)
   {
-    Servo_SetAngle(i, angle);
+    uint16_t t = angle;
+    if (t < joint_min[i]) { t = joint_min[i]; }
+    if (t > joint_max[i]) { t = joint_max[i]; }
+    /* Same immediate-override semantics as single M (four-piece). */
+    axis[i].target  = t;
+    axis[i].current = (float)t;
+    axis[i].vel     = 0.0f;
+    axis[i].settled = 0U;
+    Servo_SetAngle(i, t);
   }
 }
 
@@ -218,7 +242,7 @@ static uint8_t Cmd_CheckChecksum(char *line)
 static void Cmd_Execute(const char *line)
 {
   char reply[64];
-  uint16_t a, b;
+  uint16_t a;
   int ia, ib;
 
   if ((line[0] == 'M') || (line[0] == 'm'))
@@ -249,10 +273,20 @@ static void Cmd_Execute(const char *line)
       {
         if ((ia >= 1) && (ia <= 6) && (ib >= 0))
         {
-          a = (uint16_t)ia;
-          b = (uint16_t)ib;
-          Servo_SetAngle((uint8_t)(a - 1U), b);
-          sprintf(reply, "OK M%u %u\r\n", a, (uint16_t)servo_angle[a - 1U]);
+          uint8_t c = (uint8_t)(ia - 1U);
+          uint16_t t = (uint16_t)ib;
+          if (t < joint_min[c]) { t = joint_min[c]; }
+          if (t > joint_max[c]) { t = joint_max[c]; }
+          /* Immediate single-axis override, four-piece (ADR-3 §4):
+           * target+current snap prevents reversing toward a stale G target,
+           * vel reset prevents a residual-velocity spike, settled restarts
+           * the DONE window. Other axes' trapezoids are untouched. */
+          axis[c].target  = t;
+          axis[c].current = (float)t;
+          axis[c].vel     = 0.0f;
+          axis[c].settled = 0U;
+          Servo_SetAngle(c, t);
+          sprintf(reply, "OK M%u %u\r\n", a, t);
           CDC_SendString(reply);
         }
         else { CDC_SendString("ERR\r\n"); }
@@ -269,29 +303,95 @@ static void Cmd_Execute(const char *line)
   }
   else if ((line[0] == 'S') || (line[0] == 's'))
   {
+    /* Reports the ramped CURRENT position (rounded), not the raw target:
+     * during motion this shows true commanded-so-far values. */
     sprintf(reply, "S1=%u S2=%u S3=%u S4=%u S5=%u S6=%u\r\n",
-            (uint16_t)servo_angle[0], (uint16_t)servo_angle[1],
-            (uint16_t)servo_angle[2], (uint16_t)servo_angle[3],
-            (uint16_t)servo_angle[4], (uint16_t)servo_angle[5]);
+            (uint16_t)(axis[0].current + 0.5f), (uint16_t)(axis[1].current + 0.5f),
+            (uint16_t)(axis[2].current + 0.5f), (uint16_t)(axis[3].current + 0.5f),
+            (uint16_t)(axis[4].current + 0.5f), (uint16_t)(axis[5].current + 0.5f));
     CDC_SendString(reply);
+  }
+  else if ((line[0] == 'G') || (line[0] == 'g'))
+  {
+    int gv[6];
+    uint8_t gi;
+    uint8_t bad = 0U;
+    if (sscanf(line + 1, "%d %d %d %d %d %d",
+               &gv[0], &gv[1], &gv[2], &gv[3], &gv[4], &gv[5]) == 6)
+    {
+      for (gi = 0U; gi < 6U; gi++)
+      {
+        if (gv[gi] < 0) { bad = 1U; }
+      }
+      if (bad == 0U)
+      {
+        for (gi = 0U; gi < 6U; gi++)
+        {
+          uint16_t t = (uint16_t)gv[gi];
+          if (t < joint_min[gi]) { t = joint_min[gi]; }
+          if (t > joint_max[gi]) { t = joint_max[gi]; }
+          axis[gi].target  = t;
+          axis[gi].vel     = 0.0f;   /* G arrives between waypoints (PC waits
+                                        for DONE); zeroing vel is predictable */
+          axis[gi].settled = 0U;
+          axis[gi].stagger = (uint8_t)(gi * STAGGER_TICKS);
+        }
+        motion_done     = 0U;
+        move_start_tick = HAL_GetTick();
+        sprintf(reply, "OK G %u %u %u %u %u %u\r\n",
+                axis[0].target, axis[1].target, axis[2].target,
+                axis[3].target, axis[4].target, axis[5].target);
+        CDC_SendString(reply);
+      }
+      else { CDC_SendString("ERR\r\n"); }
+    }
+    else { CDC_SendString("ERR\r\n"); }
+  }
+  else if ((line[0] == 'Q') || (line[0] == 'q'))
+  {
+    if (motion_done != 0U) { CDC_SendString("DONE\r\n"); }
+    else                   { CDC_SendString("BUSY\r\n"); }
   }
   else if ((line[0] == 'H') || (line[0] == 'h'))
   {
     static const uint16_t home_servo[6] = {90U, 135U, 60U, 75U, 90U, 90U};
     uint8_t hi;
+    uint8_t was_estop = estop_active;
     estop_active = 0U;
     for (hi = 0U; hi < 6U; hi++)
     {
-      servo_target[hi] = home_servo[hi];
+      axis[hi].target  = home_servo[hi];
+      axis[hi].vel     = 0.0f;
+      axis[hi].settled = 0U;
+      axis[hi].stagger = 0U;
+      if (was_estop != 0U)
+      {
+        /* Post-E the physical position is UNKNOWN (open-loop servos lost
+         * position when PWM stopped). Never glide from a stale current.
+         * Reset bookkeeping to HOME and leave PWM OFF: the PC-side
+         * soft_start re-enables axes one by one (200 ms apart). */
+        axis[hi].current = (float)home_servo[hi];
+      }
+      else
+      {
+        /* Normal H: current is trustworthy -> glide home via trapezoid. */
+        motion_done = 0U;
+      }
     }
-    ramp_active = 1U;
-    ramp_tick = HAL_GetTick();
+    if (was_estop == 0U) { move_start_tick = HAL_GetTick(); }
     CDC_SendString("OK H\r\n");
   }
   else if ((line[0] == 'E') || (line[0] == 'e'))
   {
+    uint8_t ei;
     estop_active = 1U;
     Servo_DisableAll();
+    for (ei = 0U; ei < 6U; ei++)
+    {
+      axis[ei].vel     = 0.0f;   /* freeze motion state */
+      axis[ei].stagger = 0U;
+    }
+    motion_done = 1U;            /* nothing is moving; timeout protection resumes */
     CDC_SendString("OK E\r\n");
   }
   else
@@ -347,8 +447,16 @@ void CDC_ProcessRx(void)
   */
 void CDC_TimeoutCheck(void)
 {
-  if ((timeout_active == 0U) &&
-      (HAL_GetTick() - last_cmd_tick > CMD_TIMEOUT_MS))
+  if (timeout_active != 0U) { return; }
+
+  /* While a commanded motion runs, the idle-timeout is suppressed: normally
+   * Q polling refreshes last_cmd_tick anyway, and suppression covers the
+   * PC-died-mid-motion case so the arm completes its planned trajectory
+   * instead of collapsing mid-swing. MOTION_HARD_CAP_MS (enforced in
+   * Servo_RampStep) guarantees this suppression cannot last forever. */
+  if (motion_done == 0U) { return; }
+
+  if ((HAL_GetTick() - last_cmd_tick) > CMD_TIMEOUT_MS)
   {
     timeout_active = 1U;
     Servo_DisableAll();
@@ -356,33 +464,78 @@ void CDC_TimeoutCheck(void)
 }
 
 /**
-  * @brief  Gradual ramp: move each servo 1 step toward its target angle.
-  *         Called from main loop. Non-blocking; paces via HAL_GetTick().
+  * @brief  Trapezoidal motion executor (ADR-3 §3). Called from main loop.
+  *         Per axis: accelerate to MAX_VEL, cruise, decelerate along
+  *         v^2/(2a) distance, settle SETTLE_TICKS at target.
+  *         Non-blocking; paced by HAL_GetTick every RAMP_TICK_MS.
   */
 void Servo_RampStep(void)
 {
-  uint8_t i, all_done = 1U;
+  uint8_t i;
+  uint8_t all_settled = 1U;
 
-  if (ramp_active == 0U) return;
-  if ((HAL_GetTick() - ramp_tick) < RAMP_STEP_MS) return;
+  if (estop_active != 0U) { return; }
+  if ((HAL_GetTick() - ramp_tick) < RAMP_TICK_MS) { return; }
   ramp_tick = HAL_GetTick();
 
   for (i = 0U; i < 6U; i++)
   {
-    if (servo_angle[i] < servo_target[i])
+    ServoAxis *ax = &axis[i];
+    float dist;
+    float decel_dist;
+    float step;
+
+    if (ax->stagger > 0U)
     {
-      uint16_t next = servo_angle[i] + RAMP_STEP_DEG;
-      if (next > servo_target[i]) next = servo_target[i];
-      Servo_SetAngle(i, next);
-      all_done = 0U;
+      ax->stagger--;
+      all_settled = 0U;          /* motion pending: not settled yet */
+      continue;
     }
-    else if (servo_angle[i] > servo_target[i])
+
+    dist = (float)ax->target - ax->current;
+    if (dist < 0.0f) { dist = -dist; }
+
+    if (dist < REACH_TOL)
     {
-      uint16_t next = servo_angle[i] - RAMP_STEP_DEG;
-      if (next < servo_target[i]) next = servo_target[i];
-      Servo_SetAngle(i, next);
-      all_done = 0U;
+      ax->vel = 0.0f;
+      if (ax->settled < 255U) { ax->settled++; }
+      if (ax->settled < SETTLE_TICKS) { all_settled = 0U; }
+      continue;
     }
+
+    all_settled = 0U;
+
+    /* Adaptive braking distance v^2/(2a), recomputed every tick - a fixed
+     * decel window was proven non-convergent in review. */
+    decel_dist = (ax->vel * ax->vel) / (2.0f * ACC_PER_TICK);
+    if (dist > decel_dist)
+    {
+      if (ax->vel < MAX_VEL) { ax->vel += ACC_PER_TICK; }   /* accel / cruise */
+    }
+    else
+    {
+      ax->vel -= ACC_PER_TICK;                              /* decelerate */
+      if (ax->vel < ACC_PER_TICK) { ax->vel = ACC_PER_TICK; } /* crawl floor */
+    }
+
+    step = (ax->vel < dist) ? ax->vel : dist;               /* no overshoot */
+    if ((float)ax->target >= ax->current) { ax->current += step; }
+    else                                  { ax->current -= step; }
+    Servo_SetAngle(i, (uint16_t)(ax->current + 0.5f));
   }
-  if (all_done != 0U) { ramp_active = 0U; }
+
+  motion_done = all_settled;
+
+  /* Hard cap: if motion somehow never completes (stale target unreachable),
+   * force-complete so idle-timeout protection resumes. */
+  if ((motion_done == 0U) &&
+      ((HAL_GetTick() - move_start_tick) > MOTION_HARD_CAP_MS))
+  {
+    for (i = 0U; i < 6U; i++)
+    {
+      axis[i].vel     = 0.0f;
+      axis[i].settled = SETTLE_TICKS;
+    }
+    motion_done = 1U;
+  }
 }

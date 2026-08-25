@@ -1,17 +1,14 @@
 # -*- coding: utf-8 -*-
-"""trajectory.py — 关节空间插补 + 单方向逼近消隙。
+"""trajectory.py — waypoint 模式执行 + 单方向逼近消隙（ADR-3）。
 
-规划（PC 端，ADR-6）：梯形速度轮廓（加速-匀速-减速），
-参数 MAX_VEL=30°/s, MAX_ACC=15°/s²（MG996 极限 60°/s 的 50%，待实测调参）。
-插补周期 DT_MS=20ms 对齐舵机 50Hz 刷新。
+执行模型（ADR-3 P1/P2）：PC 只发关键拐点（G 命令，六轴批量目标），
+MCU 自主梯形执行（30°/s, 15°/s²），PC 轮询 Q 等 DONE。PC 不再逐 20ms
+刷点——90° 运动 = 1 条 G（原 ~250 条 M），Windows 卡顿不再影响运动中时序。
 
-消隙（架构书 §4）：每关节记录上次运动方向；本次反向运动时先同向过冲
-OVERSHOOT=15°，再从过冲点逼近目标 —— 保证最终逼近方向与上次一致，
-消除虚位（最大 ~8°）。
+消隙（架构书 §4）：每关节记录上次运动方向；本次反向运动时先发过冲点
+OVERSHOOT=15°，等 DONE 后再发目标点 —— 最终逼近方向与上次一致。
 
-执行：单关节 M 命令逐点下发（固件回显 clamp 值 → 回显铁律逐点校验），
-不用 MALL（MALL 无逐关节回显，回显铁律失效）。CLAMP/TIMEOUT 抛异常，
-由状态机转 ERROR。
+plan_joint_move 保留仅作 DONE 超时估算参考/测试用途，不再用于执行。
 """
 
 import math
@@ -25,7 +22,7 @@ class TrajectoryError(RuntimeError):
 
 
 def plan_joint_move(from_q, to_q, dt_ms=None, max_vel=None, max_acc=None):
-    """梯形速度规划。返回插补点列表（每点 q[6]），间隔 dt_ms。"""
+    """梯形速度规划（保留：DONE 超时估算与离线测试用，执行已下沉 MCU）。"""
     dt_ms = dt_ms or config.DT_MS
     v = max_vel or config.MAX_VEL
     a = max_acc or config.MAX_ACC
@@ -63,43 +60,18 @@ def plan_joint_move(from_q, to_q, dt_ms=None, max_vel=None, max_acc=None):
 
 
 class Trajectory:
-    """轨迹执行器：保存每关节上次运动方向（消隙），逐点校验回显。
+    """waypoint 执行器：保存每关节上次运动方向（消隙），发 G 等 DONE。
 
-    定时：目标时间戳 + 忙等补偿。Windows time.sleep(0.02) 实际粒度 ~31ms
-    （系统时钟 15.6ms 向上取整），直接 sleep 会让 20ms 插补周期漂到 31ms，
-    长轨迹累计超时。忙等补偿保证每点精确 DT_MS（上位机 PC 无 CPU 压力）。
+    时间轴归属：运动中的时间轴在 MCU（梯形自主执行），PC 只决定
+    "下一个拐点去哪"。DONE 超时 = 预估时长 × FACTOR + EXTRA，超时抛
+    TrajectoryError 由状态机转 ERROR（不重试，IWDG 是 MCU 侧底线）。
     """
 
     def __init__(self):
         self.last_dir = [0] * 6
 
-    def _exec_point(self, serial, pt, deadline):
-        """逐关节下发插补点，忙等到 deadline。返回下一 deadline。
-
-        跳过零增量关节（dq≈0 不重发）：夹爪/静止关节免去 5/6 串口流量，
-        直接决定 GRIP/RELEASE 是否假超时（P1-2）。
-        """
-        from_q = serial.joint_state
-        for n in range(1, 7):
-            ang = pt[n - 1]
-            if abs(ang - from_q[n - 1]) < 1e-9:
-                continue
-            ok, msg = serial.move_joint(n, ang)
-            if not ok:
-                raise TrajectoryError("joint %d: %s" % (n, msg))
-        # 用实际耗时校准下一 deadline（防止串口延迟导致周期漂移）
-        now = time.perf_counter()
-        while now < deadline:
-            now = time.perf_counter()
-        return now + config.DT_MS / 1000.0
-
-    def _run_plan(self, serial, pts):
-        deadline = time.perf_counter()
-        for pt in pts:
-            deadline = self._exec_point(serial, pt, deadline)
-
     def move_to(self, serial, to_q, overshoot=True):
-        """从 serial.joint_state（实际回显状态）规划并执行到 to_q。
+        """从 serial.joint_state 执行到 to_q（1~2 条 G 命令）。
 
         overshoot=False 用于朝工作面/目标的最终逼近（DESCEND / FINAL_ALIGN /
         _servo_align）：反向消隙过冲会把末端压到目标点之外（15° 关节角在臂展
@@ -107,7 +79,7 @@ class Trajectory:
         """
         from_q = list(serial.joint_state)
 
-        # --- 单方向逼近：反向关节先过冲（过冲不超限位，P2-2）---
+        # --- 单方向逼近：反向关节先发过冲点（过冲不超限位，P2-2）---
         overshoot_q = list(to_q)
         needs_overshoot = False
         if overshoot:
@@ -124,18 +96,18 @@ class Trajectory:
                     needs_overshoot = True
 
         if needs_overshoot:
-            self._run_plan(serial, plan_joint_move(from_q, overshoot_q))
-            from_q = overshoot_q
+            ok, msg = serial.move_waypoint(overshoot_q)
+            if not ok:
+                raise TrajectoryError("overshoot: %s" % msg)
 
         # --- 主运动（最终逼近方向 = 本次方向）---
-        self._run_plan(serial, plan_joint_move(from_q, to_q))
+        ok, msg = serial.move_waypoint(to_q)
+        if not ok:
+            raise TrajectoryError("waypoint: %s" % msg)
 
         # --- 记录方向 ---
         for i in range(6):
             if abs(to_q[i] - overshoot_q[i]) > 1e-6:
                 self.last_dir[i] = 1 if to_q[i] > overshoot_q[i] else -1
-
-        # --- 周期性 S 对账：确认实际角度与期望一致 ---
-        serial.query_state()
 
         time.sleep(config.SETTLE_MS / 1000.0)   # 到位稳定
