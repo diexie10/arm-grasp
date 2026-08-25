@@ -85,6 +85,19 @@ static uint32_t ramp_tick       = 0U;  /* RampStep pacing                    */
 static const uint16_t joint_min[6] = {0U, 30U, 10U, 0U, 45U, 30U};
 static const uint16_t joint_max[6] = {180U, 180U, 150U, 180U, 135U, 120U};
 
+/* Horn-hole compensation (per-axis mechanical trim). Servo horn drilling is
+ * imprecise: the link sits true only at a physical angle offset from logical.
+ * physical = logical + trim; applied ONLY at pulse conversion, so limits,
+ * HOME table and echoes all stay in logical domain. Fill per axis on
+ * assembly-day measurement. */
+static const int8_t servo_trim[6] = {-7, 0, 0, 0, 0, 0};
+
+/* Overtravel REMOVED after live test: this servo REJECTS pulses outside
+ * 500..2500us (holds position instead of moving), which desyncs the
+ * open-loop bookkeeping and causes a visible snap when the ramp re-enters
+ * the valid band. Trim must therefore be absorbed by re-seating the horn
+ * mechanically, not by commanding past the band edge. */
+
 /* Safety state flags */
 static volatile uint8_t estop_active    = 0U;  /* E command: PWM stopped      */
 static volatile uint8_t timeout_active   = 0U; /* no command for 10s          */
@@ -144,13 +157,22 @@ int8_t CDC_SendString(const char *str)
 static void Servo_SetAngle(uint8_t ch, uint16_t angle)
 {
   uint16_t cmp;
+  int32_t phys;
 
   if (ch >= 6U) return;
 
   /* Angle -> pulse width -> compare value. Callers own clamping and the
-   * axis[] bookkeeping; this is pure PWM output + lazy start. */
-  cmp = SERVO_MIN_PULSE +
-        ((uint32_t)angle * (SERVO_MAX_PULSE - SERVO_MIN_PULSE)) / SERVO_MAX_ANGLE;
+   * axis[] bookkeeping; this is pure PWM output + lazy start.
+   * Horn trim applied here (physical = logical + trim), clamped BACK into
+   * the valid 500..2500us band: this servo ignores out-of-band pulses
+   * (verified live 2026-08-25), and ignored pulses desync open-loop state.
+   * ALL math signed: casting negative phys to uint32 wraps around and
+   * produces garbage pulse widths (self-review catch, 2026-08-25). */
+  phys = (int32_t)angle + (int32_t)servo_trim[ch];
+  if (phys < 0)                  { phys = 0; }
+  if (phys > SERVO_MAX_ANGLE)    { phys = SERVO_MAX_ANGLE; }
+  cmp = (uint16_t)(SERVO_MIN_PULSE +
+        (phys * ((int32_t)SERVO_MAX_PULSE - (int32_t)SERVO_MIN_PULSE)) / SERVO_MAX_ANGLE);
 
   __HAL_TIM_SET_COMPARE(servo_map[ch].tim, servo_map[ch].chan, cmp);
 
@@ -286,7 +308,7 @@ static void Cmd_Execute(const char *line)
           axis[c].vel     = 0.0f;
           axis[c].settled = 0U;
           Servo_SetAngle(c, t);
-          sprintf(reply, "OK M%u %u\r\n", a, t);
+          sprintf(reply, "OK M%u %u\r\n", (uint16_t)ia, t);
           CDC_SendString(reply);
         }
         else { CDC_SendString("ERR\r\n"); }
