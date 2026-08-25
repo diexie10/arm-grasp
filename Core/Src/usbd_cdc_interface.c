@@ -92,11 +92,12 @@ static const uint16_t joint_max[6] = {180U, 180U, 150U, 180U, 135U, 120U};
  * assembly-day measurement. */
 static const int8_t servo_trim[6] = {-7, 0, 0, 0, 0, 0};
 
-/* Overtravel REMOVED after live test: this servo REJECTS pulses outside
- * 500..2500us (holds position instead of moving), which desyncs the
- * open-loop bookkeeping and causes a visible snap when the ramp re-enters
- * the valid band. Trim must therefore be absorbed by re-seating the horn
- * mechanically, not by commanding past the band edge. */
+/* Overtravel margin beyond the logical 0..SERVO_MAX_ANGLE band: the servo's
+ * mechanical travel extends past the conservative band edge (user-verified),
+ * so the trim may push slightly past it. NOTE: this requires the pulse math
+ * below to stay fully signed - an unsigned cast wraps negative phys into
+ * CCR > ARR (constant-high output = signal loss = servo holds). */
+#define TRIM_OVERTRAVEL_DEG  30
 
 /* Safety state flags */
 static volatile uint8_t estop_active    = 0U;  /* E command: PWM stopped      */
@@ -163,14 +164,13 @@ static void Servo_SetAngle(uint8_t ch, uint16_t angle)
 
   /* Angle -> pulse width -> compare value. Callers own clamping and the
    * axis[] bookkeeping; this is pure PWM output + lazy start.
-   * Horn trim applied here (physical = logical + trim), clamped BACK into
-   * the valid 500..2500us band: this servo ignores out-of-band pulses
-   * (verified live 2026-08-25), and ignored pulses desync open-loop state.
-   * ALL math signed: casting negative phys to uint32 wraps around and
-   * produces garbage pulse widths (self-review catch, 2026-08-25). */
+   * Horn trim applied here (physical = logical + trim), allowed TRIM_OVERTRAVEL_DEG
+   * past the logical band edges (servo travel verified wider than the band).
+   * ALL math signed: an unsigned cast of negative phys wraps into CCR > ARR
+   * (constant-high output = signal loss = servo holds position). */
   phys = (int32_t)angle + (int32_t)servo_trim[ch];
-  if (phys < 0)                  { phys = 0; }
-  if (phys > SERVO_MAX_ANGLE)    { phys = SERVO_MAX_ANGLE; }
+  if (phys < -TRIM_OVERTRAVEL_DEG)                  { phys = -TRIM_OVERTRAVEL_DEG; }
+  if (phys > SERVO_MAX_ANGLE + TRIM_OVERTRAVEL_DEG) { phys = SERVO_MAX_ANGLE + TRIM_OVERTRAVEL_DEG; }
   cmp = (uint16_t)(SERVO_MIN_PULSE +
         (phys * ((int32_t)SERVO_MAX_PULSE - (int32_t)SERVO_MIN_PULSE)) / SERVO_MAX_ANGLE);
 
