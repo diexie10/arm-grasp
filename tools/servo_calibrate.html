@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Arm-Grasp 舵机校准台</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'SF Mono', 'Fira Code', monospace; background: #0a0a1a; color: #c8d6e5; padding: 16px; }
+  h1 { text-align: center; color: #48dbfb; font-size: 1.4em; margin-bottom: 12px; letter-spacing: 2px; }
+  .top { display: flex; gap: 12px; justify-content: center; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
+  .top button { padding: 8px 20px; border: none; border-radius: 6px; font-size: 0.95em; cursor: pointer; font-weight: 600; }
+  #btnConn { background: #48dbfb; color: #0a0a1a; }
+  #btnConn.on { background: #ee5a24; }
+  #status { color: #576574; font-size: 0.85em; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; max-width: 1000px; margin: 0 auto; }
+  .card { background: #1e272e; border-radius: 10px; padding: 14px; border: 1px solid #2c3e50; }
+  .card h3 { color: #48dbfb; font-size: 0.95em; margin-bottom: 8px; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+  .row input[type=range] { flex: 1; accent-color: #48dbfb; height: 4px; }
+  .row .v { min-width: 44px; text-align: right; color: #48dbfb; font-size: 1.1em; }
+  .row .pw { min-width: 60px; text-align: right; color: #576574; font-size: 0.8em; }
+  .row button { padding: 4px 10px; border: 1px solid #2c3e50; background: #2c3e50; color: #c8d6e5; border-radius: 4px; cursor: pointer; font-size: 0.8em; }
+  .row button:hover { background: #48dbfb; color: #0a0a1a; }
+  .row button.go { background: #10ac84; color: #fff; border-color: #10ac84; }
+  .calib { margin-top: 8px; padding-top: 8px; border-top: 1px solid #2c3e50; }
+  .calib label { font-size: 0.8em; color: #576574; }
+  .calib input { width: 50px; padding: 2px 4px; background: #0a0a1a; border: 1px solid #2c3e50; color: #48dbfb; border-radius: 3px; font-size: 0.85em; text-align: center; }
+  #log { max-width: 1000px; margin: 14px auto 0; background: #0d1117; border-radius: 8px; padding: 10px; font-size: 0.8em; max-height: 180px; overflow-y: auto; color: #636e72; }
+  #log .s { color: #48dbfb; } #log .r { color: #10ac84; } #log .e { color: #ee5a24; }
+  .kbd { font-size: 0.75em; color: #576574; text-align: center; margin-top: 10px; }
+</style>
+</head>
+<body>
+<h1>⚙ SERVO CALIBRATION</h1>
+<div class="top">
+  <button id="btnConn" onclick="toggle()">连接</button>
+  <span id="status">未连接</span>
+</div>
+<div class="grid" id="grid"></div>
+<div id="log"></div>
+<div class="kbd">快捷键：1-6 选轴 · ← → 微调 · H 归中 · E 急停 · 空格 发送当前值</div>
+
+<script>
+const N = ['J1 底座','J2 大臂','J3 小臂','J4 腕俯仰','J5 腕旋转','J6 夹爪'];
+const HOME = [101,45,60,-15,0,90];
+const MIN_PULSE = 500, MAX_PULSE = 2500, MAX_ANGLE = 180;
+let port, writer, reader, connected=false, buf='';
+let active = 0; // 当前选中轴
+
+function pw(a, trim=0) {
+  const p = a + trim;
+  return MIN_PULSE + p * (MAX_PULSE - MIN_PULSE) / MAX_ANGLE;
+}
+
+// 构建 6 轴卡片
+const g = document.getElementById('grid');
+for (let i=0;i<6;i++) {
+  const c = document.createElement('div');
+  c.className = 'card';
+  c.innerHTML = `
+    <h3>S${i+1} ${N[i]}</h3>
+    <div class="row">
+      <span style="color:#576574;font-size:0.8em">0°</span>
+      <input type=range id="s${i}" min=0 max=270 value="${HOME[i]}" step=1
+             oninput="uv(${i})" onclick="sel(${i})">
+      <span style="color:#576574;font-size:0.8em">270°</span>
+      <span class=v id="v${i}">${HOME[i]}°</span>
+      <span class=pw id="p${i}">${Math.round(pw(HOME[i]))}µs</span>
+    </div>
+    <div class="row">
+      <button onclick="sendM(${i})" title="M 命令瞬时">M</button>
+      <button class=go onclick="sendG(${i})" title="G 命令滑行">G</button>
+      <button onclick="sendQ()">Q</button>
+      <button onclick="sendS()">S</button>
+      <span class=pw id="st${i}" style="color:#636e72">--</span>
+    </div>
+    <div class=calib>
+      <label>trim: <input type=number id="t${i}" value=0 step=1 onchange="uv(${i})"></label>
+      <label style="margin-left:8px">min: <input type=number id="mn${i}" value=0 min=0 max=270 onchange="uv(${i})"></label>
+      <label style="margin-left:8px">max: <input type=number id="mx${i}" value=180 min=0 max=270 onchange="uv(${i})"></label>
+      <label style="margin-left:8px">home: <input type=number id="hm${i}" value="${HOME[i]}" min=0 max=270 onchange="uv(${i})"></label>
+    </div>`;
+  g.appendChild(c);
+}
+
+function uv(i) {
+  const a = +document.getElementById('s'+i).value;
+  const tr = +document.getElementById('t'+i).value;
+  document.getElementById('v'+i).textContent = a+'°';
+  document.getElementById('p'+i).textContent = Math.round(pw(a,tr))+'µs';
+}
+function sel(i) { active=i; }
+
+// 连接
+async function toggle() {
+  if (connected) { reader?.cancel(); port?.close(); connected=false;
+    document.getElementById('btnConn').textContent='连接';
+    document.getElementById('btnConn').classList.remove('on');
+    document.getElementById('status').textContent='已断开'; return; }
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({baudRate:115200});
+    const dec = new TextDecoderStream();
+    reader = port.readable.pipeThrough(dec).getReader();
+    writer = port.writable.getWriter();
+    connected = true;
+    document.getElementById('btnConn').textContent='断开';
+    document.getElementById('btnConn').classList.add('on');
+    document.getElementById('status').textContent='已连接';
+    readLoop();
+  } catch(e) { document.getElementById('status').textContent='失败: '+e.message; }
+}
+
+async function readLoop() {
+  while(connected) {
+    try {
+      const {value,done} = await reader.read();
+      if (done) break;
+      buf += value;
+      let idx;
+      while ((idx=buf.indexOf('\n'))!==-1) {
+        const line = buf.slice(0,idx).trim();
+        buf = buf.slice(idx+1);
+        if (line) log(line, 'r');
+      }
+    } catch(e) { break; }
+  }
+}
+
+async function send(cmd) {
+  if (!connected) return;
+  await writer.write(new TextEncoder().encode(cmd+'\n'));
+  log('> '+cmd, 's');
+}
+
+function sendM(i) {
+  const a = document.getElementById('s'+i).value;
+  send('M'+(i+1)+' '+a);
+}
+function sendG(i) {
+  const a = document.getElementById('s'+i).value;
+  send('G '+Array.from({length:6},(_,j)=>j===i?a:HOME[j]).join(' '));
+}
+function sendQ() { send('Q'); }
+function sendS() { send('S'); }
+
+// 快捷键
+let selServo = 0;
+document.addEventListener('keydown', e => {
+  if (e.target.tagName==='INPUT') return;
+  const s = document.getElementById('s'+selServo);
+  switch(e.key) {
+    case '1':case '2':case '3':case '4':case '5':case '6':
+      selServo=+e.key-1; sel(selServo); s.focus(); break;
+    case 'ArrowLeft': s.value=Math.max(0,+s.value-1); uv(selServo); break;
+    case 'ArrowRight': s.value=Math.min(270,+s.value+1); uv(selServo); break;
+    case ' ': e.preventDefault(); sendM(selServo); break;
+    case 'h':case 'H': send('H'); break;
+    case 'e':case 'E': send('E'); break;
+  }
+});
+
+function log(t,cls) {
+  const el=document.getElementById('log');
+  const d=document.createElement('div');
+  d.className=cls||''; d.textContent=t;
+  el.appendChild(d); el.scrollTop=el.scrollHeight;
+  while(el.children.length>200) el.removeChild(el.firstChild);
+}
+</script>
+</body>
+</html>
