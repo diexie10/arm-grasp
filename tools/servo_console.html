@@ -29,6 +29,14 @@
   #log { max-width: 900px; margin: 20px auto 0; background: #0d1117; border-radius: 8px; padding: 12px; font-family: monospace; font-size: 0.85em; max-height: 200px; overflow-y: auto; color: #8b949e; }
   #log div.sent { color: #58a6ff; }
   #log div.recv { color: #3fb950; }
+  #log div.pass { color: #2ed573; font-weight: bold; }
+  #log div.fail { color: #ff4757; font-weight: bold; }
+  #log div.info { color: #ffa502; }
+  #motionBadge { display: inline-block; padding: 4px 14px; border-radius: 12px; font-size: 0.85em; font-weight: bold; margin-left: 10px; background: #333; color: #888; }
+  #motionBadge.busy { background: #ffa502; color: #1a1a2e; }
+  #motionBadge.done { background: #2ed573; color: #1a1a2e; }
+  #btnGlide { background: #1a4a8a; color: #fff; }
+  #btnTest { background: #9c27b0; color: #fff; }
 </style>
 </head>
 <body>
@@ -37,6 +45,7 @@
 <div class="connection">
   <button id="btnConnect" onclick="toggleConnect()">连接 CH340</button>
   <button onclick="sendCmd('S')">查询状态 (S)</button>
+  <span id="motionBadge">--</span>
   <div id="status">未连接</div>
 </div>
 
@@ -44,8 +53,10 @@
 
 <div class="actions">
   <button id="btnHome" onclick="sendHome()">归中 (H)</button>
+  <button id="btnGlide" onclick="sendGlide()">G 滑行发送（六轴）</button>
   <button id="btnStop" onclick="sendCmd('E')">急停 (E)</button>
   <button onclick="sendCmd('I')">读红外 (I)</button>
+  <button id="btnTest" onclick="runAutoTest()">▶ 一键自动测试</button>
 </div>
 
 <div id="log"></div>
@@ -71,7 +82,7 @@ for (let i = 0; i < 6; i++) {
       <input type="range" id="s${i}" min="0" max="180" value="${HOME_ANGLES[i]}" oninput="updateVal(${i})">
       <span style="font-size:0.8em;color:#666">180°</span>
       <span class="val" id="v${i}">${HOME_ANGLES[i]}°</span>
-      <button onclick="sendServo(${i})">发送</button>
+      <button onclick="sendServo(${i})" title="M 命令：立即覆盖（瞬跳）">M发</button>
     </div>`;
   container.appendChild(card);
 }
@@ -117,7 +128,7 @@ async function readLoop() {
       while ((idx = readBuffer.indexOf('\n')) !== -1) {
         const line = readBuffer.slice(0, idx).trim();
         readBuffer = readBuffer.slice(idx + 1);
-        if (line) log(line, 'recv');
+        if (line) { log(line, 'recv'); dispatchLine(line); }
       }
     } catch (e) {
       if (connected) log('读取错误: ' + e.message, 'recv');
@@ -149,6 +160,120 @@ function sendHome() {
     document.getElementById('s' + i).value = HOME_ANGLES[i];
     updateVal(i);
   }
+}
+
+// ---------- 应答等待机制：readLoop 把行分发给 waiter ----------
+let waiters = [];  // {test: fn(line)->bool, resolve: fn(line|null)}
+
+function waitFor(test, timeoutMs) {
+  return new Promise(resolve => {
+    const w = { test, resolve };
+    waiters.push(w);
+    setTimeout(() => {
+      const idx = waiters.indexOf(w);
+      if (idx !== -1) { waiters.splice(idx, 1); resolve(null); }
+    }, timeoutMs);
+  });
+}
+
+async function sendAndWait(cmd, test, timeoutMs = 2000) {
+  const p = waitFor(test, timeoutMs);
+  await sendCmd(cmd);
+  return p;
+}
+
+// 在 readLoop 的行处理里调用
+function dispatchLine(line) {
+  for (let i = waiters.length - 1; i >= 0; i--) {
+    if (waiters[i].test(line)) {
+      const w = waiters.splice(i, 1)[0];
+      w.resolve(line);
+    }
+  }
+}
+
+// ---------- G 滑行发送 + Q 轮询 ----------
+function setBadge(state) {
+  const b = document.getElementById('motionBadge');
+  b.className = state;   // '', 'busy', 'done'
+  b.textContent = state === 'busy' ? 'BUSY 运动中' : (state === 'done' ? 'DONE 到位' : '--');
+}
+
+async function pollQUntilDone(timeoutMs = 20000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const line = await sendAndWait('Q',
+      l => l.includes('DONE') || l.includes('BUSY'), 1500);
+    if (line === null) { setBadge(''); return -1; }        // 超时无应答
+    if (line.includes('DONE')) { setBadge('done'); return Date.now() - start; }
+    setBadge('busy');
+    await new Promise(r => setTimeout(r, 100));
+  }
+  setBadge('');
+  return -1;
+}
+
+async function sendGlide() {
+  const vals = [];
+  for (let i = 0; i < 6; i++) vals.push(document.getElementById('s' + i).value);
+  const resp = await sendAndWait('G ' + vals.join(' '), l => l.startsWith('OK G'));
+  if (resp === null) { log('G 无应答', 'fail'); return; }
+  log('滑行中…（对比：M 按钮是瞬跳）', 'info');
+  const elapsed = await pollQUntilDone();
+  log(elapsed >= 0 ? `✓ 到位，耗时 ${(elapsed/1000).toFixed(2)}s` : '✗ DONE 超时',
+      elapsed >= 0 ? 'pass' : 'fail');
+}
+
+// ---------- 一键自动测试（ADR-3 J1 单轴清单）----------
+async function step(name, cmd, test) {
+  log(`— ${name}: 发 ${cmd}`, 'info');
+  const line = await sendAndWait(cmd, test, 2500);
+  if (line === null) { log(`✗ ${name} FAIL（无应答）`, 'fail'); return false; }
+  log(`  ← ${line}`, 'recv');
+  return true;
+}
+
+async function runAutoTest() {
+  document.getElementById('btnTest').disabled = true;
+  log('===== ADR-3 单轴自动测试开始 =====', 'info');
+  let pass = 0, total = 0;
+
+  // T1: G 滑行 + DONE 耗时（30° @ 30°/s ≈ 1s + 起停 ≈ 1.5~3s 合理）
+  total++;
+  log('— T1 G 滑行: 发 G 120 90 60 75 90 90', 'info');
+  let r = await sendAndWait('G 120 90 60 75 90 90', l => l.startsWith('OK G') || l.startsWith('ERR'), 2500);
+  if (r && r.startsWith('OK G')) {
+    const ms = await pollQUntilDone(15000);
+    if (ms >= 500 && ms <= 8000) { log(`✓ T1 PASS（滑行+到位 ${ (ms/1000).toFixed(2) }s）`, 'pass'); pass++; }
+    else { log(`✗ T1 FAIL（耗时 ${ms}ms 不在 0.5~8s 区间）`, 'fail'); }
+  } else { log(`✗ T1 FAIL（应答: ${r})`, 'fail'); }
+
+  // T2: M 瞬跳对比
+  total++;
+  if (await step('T2 M 瞬跳', 'M1 40', l => l.startsWith('OK M1'))) {
+    log('✓ T2 PASS（M 应瞬跳，G 应滑行——肉眼对比）', 'pass'); pass++;
+  }
+
+  // T3: E 急停
+  total++;
+  if (await step('T3 急停', 'E', l => l.startsWith('OK E'))) {
+    log('✓ T3 PASS（舵机应变软）', 'pass'); pass++;
+  }
+
+  // T4: H 后保持软（急停后 H 不自动使能）
+  total++;
+  if (await step('T4 H 复位', 'H', l => l.startsWith('OK H'))) {
+    log('✓ T4 PASS（H 后应仍软——soft_start 才恢复）', 'pass'); pass++;
+  }
+
+  // T5: M 单轴恢复
+  total++;
+  if (await step('T5 M 恢复', 'M1 90', l => l.startsWith('OK M1'))) {
+    log('✓ T5 PASS（J1 单独回 90°）', 'pass'); pass++;
+  }
+
+  log(`===== 测试结束：${pass}/${total} PASS =====`, pass === total ? 'pass' : 'fail');
+  document.getElementById('btnTest').disabled = false;
 }
 
 function log(text, cls) {
