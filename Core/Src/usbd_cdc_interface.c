@@ -316,6 +316,7 @@ static void Cmd_Execute(const char *line)
     int gv[6];
     uint8_t gi;
     uint8_t bad = 0U;
+    if (estop_active != 0U) { CDC_SendString("ERR\r\n"); return; }
     if (sscanf(line + 1, "%d %d %d %d %d %d",
                &gv[0], &gv[1], &gv[2], &gv[3], &gv[4], &gv[5]) == 6)
     {
@@ -334,7 +335,11 @@ static void Cmd_Execute(const char *line)
           axis[gi].vel     = 0.0f;   /* G arrives between waypoints (PC waits
                                         for DONE); zeroing vel is predictable */
           axis[gi].settled = 0U;
-          axis[gi].stagger = (uint8_t)(gi * STAGGER_TICKS);
+          /* Stagger only axes that actually move: an unmoved axis holding a
+           * stagger counter would delay DONE by up to i*STAGGER_TICKS. */
+          axis[gi].stagger =
+            ((t != (uint16_t)(axis[gi].current + 0.5f)))
+              ? (uint8_t)(gi * STAGGER_TICKS) : 0U;
         }
         motion_done     = 0U;
         move_start_tick = HAL_GetTick();
