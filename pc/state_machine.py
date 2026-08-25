@@ -387,7 +387,8 @@ class StateMachine:
                     q[1] += dq12
                     q[2] += dq12
                     q[3] = 90.0 - q[1] - q[2]      # 保持末端竖直
-                    q[4] = theta_deg - q[0]          # J5 对齐夹爪朝向（θ − J1）
+                    if config.J5_ALIGN_ENABLED:     # θ 符号/象限实测后才启用（config）
+                        q[4] = theta_deg - q[0]    # J5 对齐夹爪朝向（θ − J1）
                     for i in range(6):
                         if q[i] < config.JOINT_MIN[i] or q[i] > config.JOINT_MAX[i]:
                             return self._to_error(
