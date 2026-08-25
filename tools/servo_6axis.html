@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>6轴机械臂控制台</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'SF Mono', 'Fira Code', monospace; background: #0a0a1a; color: #c8d6e5; padding: 16px; }
+  h1 { text-align: center; color: #48dbfb; font-size: 1.3em; margin-bottom: 12px; letter-spacing: 2px; }
+  .top { display: flex; gap: 10px; justify-content: center; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
+  .top button { padding: 8px 16px; border: none; border-radius: 6px; font-size: 0.9em; cursor: pointer; font-weight: 600; }
+  #btnConn { background: #48dbfb; color: #0a0a1a; }
+  #btnConn.on { background: #ee5a24; }
+  #status { color: #576574; font-size: 0.85em; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; max-width: 900px; margin: 0 auto 14px; }
+  .card { background: #1e272e; border-radius: 10px; padding: 12px; border: 1px solid #2c3e50; }
+  .card h3 { color: #48dbfb; font-size: 0.9em; margin-bottom: 6px; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+  .row input[type=range] { flex: 1; accent-color: #48dbfb; height: 4px; }
+  .row .v { min-width: 40px; text-align: right; color: #48dbfb; font-size: 1em; }
+  .row .pw { min-width: 55px; text-align: right; color: #576574; font-size: 0.75em; }
+  .actions { display: flex; gap: 8px; justify-content: center; margin-bottom: 14px; flex-wrap: wrap; }
+  .actions button { padding: 10px 20px; border: none; border-radius: 6px; font-size: 0.95em; cursor: pointer; font-weight: 600; }
+  .btnG { background: #10ac84; color: #fff; }
+  .btnH { background: #48dbfb; color: #0a0a1a; }
+  .btnE { background: #ee5a24; color: #fff; }
+  .btnQ { background: #576574; color: #fff; }
+  .btnS { background: #576574; color: #fff; }
+  #log { max-width: 900px; margin: 0 auto; background: #0d1117; border-radius: 8px; padding: 8px; font-size: 0.8em; max-height: 120px; overflow-y: auto; color: #636e72; }
+  #log .s { color: #48dbfb; } #log .r { color: #10ac84; }
+  .kbd { font-size: 0.7em; color: #576574; text-align: center; margin-top: 8px; }
+</style>
+</head>
+<body>
+<h1>⚙ 6-AXIS ARM</h1>
+<div class="top">
+  <button id="btnConn" onclick="toggle()">连接</button>
+  <span id="status">未连接</span>
+</div>
+<div class="grid" id="grid"></div>
+<div class="actions">
+  <button class="btnG" onclick="sendG()" title="G 滑行到当前所有角度">G 全轴滑行</button>
+  <button class="btnH" onclick="sendCmd('H')" title="H 归中">H 归中</button>
+  <button class="btnE" onclick="sendCmd('E')" title="E 急停">E 急停</button>
+  <button class="btnQ" onclick="sendCmd('Q')" title="Q 查状态">Q</button>
+  <button class="btnS" onclick="sendCmd('S')" title="S 查角度">S</button>
+</div>
+<div id="log"></div>
+<div class="kbd">快捷键：1-6 选轴 · ← → 微调 · 空格=G滑行 · H 归中 · E 急停</div>
+
+<script>
+const NAMES = ['J1 底座','J2 大臂','J3 小臂','J4 腕俯仰','J5 腕旋转','J6 夹爪'];
+const HOME = [101,93,95,-15,0,90];
+const MIN_P = 500, MAX_P = 2500, MAX_A = 180;
+let port, writer, reader, connected = false, buf = '';
+let sel = 0;
+
+function pw(a) { return Math.round(MIN_P + a * (MAX_P - MIN_P) / MAX_A); }
+
+// 构建 6 轴卡片
+const g = document.getElementById('grid');
+for (let i = 0; i < 6; i++) {
+  const c = document.createElement('div');
+  c.className = 'card';
+  c.innerHTML = `
+    <h3>S${i+1} ${NAMES[i]}</h3>
+    <div class="row">
+      <input type=range id="s${i}" min=0 max=270 value="${HOME[i]}" step=1
+             oninput="uv(${i})" onclick="sel=${i}">
+      <span class=v id="v${i}">${HOME[i]}°</span>
+      <span class=pw id="p${i}">${pw(HOME[i])}µs</span>
+    </div>`;
+  g.appendChild(c);
+}
+
+function uv(i) {
+  const a = +document.getElementById('s'+i).value;
+  document.getElementById('v'+i).textContent = a + '°';
+  document.getElementById('p'+i).textContent = pw(a) + 'µs';
+}
+
+// 连接
+async function toggle() {
+  if (connected) { reader?.cancel(); port?.close(); connected = false;
+    document.getElementById('btnConn').textContent = '连接';
+    document.getElementById('btnConn').classList.remove('on');
+    document.getElementById('status').textContent = '已断开'; return; }
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    const dec = new TextDecoderStream();
+    reader = port.readable.pipeThrough(dec).getReader();
+    writer = port.writable.getWriter();
+    connected = true;
+    document.getElementById('btnConn').textContent = '断开';
+    document.getElementById('btnConn').classList.add('on');
+    document.getElementById('status').textContent = '已连接';
+    readLoop();
+  } catch (e) { document.getElementById('status').textContent = '失败: ' + e.message; }
+}
+
+async function readLoop() {
+  while (connected) {
+    try {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += value;
+      let idx;
+      while ((idx = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, idx).trim();
+        buf = buf.slice(idx + 1);
+        if (line) log(line, 'r');
+      }
+    } catch (e) { break; }
+  }
+}
+
+async function sendCmd(cmd) {
+  if (!connected) return;
+  await writer.write(new TextEncoder().encode(cmd + '\n'));
+  log('> ' + cmd, 's');
+}
+
+async function sendG() {
+  const vals = [];
+  for (let i = 0; i < 6; i++) vals.push(document.getElementById('s'+i).value);
+  await sendCmd('G ' + vals.join(' '));
+}
+
+// 键盘
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  const s = document.getElementById('s' + sel);
+  switch (e.key) {
+    case '1':case '2':case '3':case '4':case '5':case '6':
+      sel = +e.key - 1; s.focus(); break;
+    case 'ArrowLeft': s.value = Math.max(0, +s.value - 1); uv(sel); break;
+    case 'ArrowRight': s.value = Math.min(270, +s.value + 1); uv(sel); break;
+    case ' ': e.preventDefault(); sendG(); break;
+    case 'h': case 'H': sendCmd('H'); break;
+    case 'e': case 'E': sendCmd('E'); break;
+  }
+});
+
+function log(t, cls) {
+  const el = document.getElementById('log');
+  const d = document.createElement('div');
+  d.className = cls || ''; d.textContent = t;
+  el.appendChild(d); el.scrollTop = el.scrollHeight;
+  while (el.children.length > 100) el.removeChild(el.firstChild);
+}
+</script>
+</body>
+</html>
