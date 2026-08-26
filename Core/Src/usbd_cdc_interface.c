@@ -56,30 +56,43 @@ static const ServoChannel servo_map[6] = {
 typedef struct {
   uint16_t target;   /* goal angle, servo domain, clamped to joint limits */
   float    current;  /* current angle, deg. Float is mandatory: integer vel
-                       made the trapezoid collapse into velocity steps */
+                        made the trapezoid collapse into velocity steps */
   float    vel;      /* signed velocity, deg/tick */
   uint8_t  settled;  /* consecutive at-target ticks (saturating at 255) */
   uint8_t  stagger;  /* start-delay ticks; G staggers axis i by i*STAGGER_TICKS */
+  uint16_t subgoal;  /* waypoint the ramp actually chases; == target except
+                        S3 stepping mode advances it in S3_STEP_DEG bites */
+  uint8_t  dwell;    /* S3: ticks parked at a bite edge before the next */
 } ServoAxis;
 static ServoAxis axis[6] = {
-  {90U, 90.0f, 0.0f, 0U, 0U}, {90U, 90.0f, 0.0f, 0U, 0U},
-  {90U, 90.0f, 0.0f, 0U, 0U}, {90U, 90.0f, 0.0f, 0U, 0U},
-  {90U, 90.0f, 0.0f, 0U, 0U}, {90U, 90.0f, 0.0f, 0U, 0U},
+  {90U, 90.0f, 0.0f, 0U, 0U, 90U, 0U}, {90U, 90.0f, 0.0f, 0U, 0U, 90U, 0U},
+  {90U, 90.0f, 0.0f, 0U, 0U, 90U, 0U}, {90U, 90.0f, 0.0f, 0U, 0U, 90U, 0U},
+  {90U, 90.0f, 0.0f, 0U, 0U, 90U, 0U}, {90U, 90.0f, 0.0f, 0U, 0U, 90U, 0U},
 };
 
 #define RAMP_TICK_MS       20U    /* x1 = 50 Hz tick, matches servo refresh */
 /* Per-axis cruise/crawl caps (deg/tick; x50 = deg/s). One global MAX_VEL=30
  * deg/s made S3 (elbow, loaded with forearm+wrist) hunt visibly: the command
  * stream outran its loaded slew (~25-35 deg/s), the servo overshot and
- * corrected every frame. S3 capped at 20 deg/s = ~70% of loaded slew. */
-static const float max_vel[6] = {0.6f, 0.6f, 0.4f, 0.6f, 0.6f, 0.6f}; /* x50 = 30/30/20/30/30/30 deg/s */
-static const float min_vel[6] = {0.15f, 0.15f, 0.12f, 0.15f, 0.15f, 0.15f}; /* crawl floor; 0.12 deg/tick = 1.33 us/tick pulse, still above deadband */
+ * corrected every frame. User verdict 2026-08-26: even 20 deg/s cruise shook;
+ * precision > speed. S3 now UNIFORM 7.5 deg/s (max==min kills the trapezoid,
+ * soft-start 0->0.15 over ~0.5 s then constant - already proven smooth as
+ * the other axes' crawl tail). */
+static const float max_vel[6] = {0.6f, 0.6f, 0.15f, 0.6f, 0.6f, 0.6f}; /* x50 = 30/30/7.5/30/30/30 deg/s */
+static const float min_vel[6] = {0.15f, 0.15f, 0.15f, 0.15f, 0.15f, 0.15f}; /* crawl floor; 0.15 deg/tick = 1.67 us/tick pulse, above deadband */
 #define ACC_PER_TICK     0.006f   /* x2500 = 15 deg/s^2 (50% of max vel)     */
 #define REACH_TOL         0.01f   /* arrival threshold, deg                  */
 #define SETTLE_TICKS         3U   /* consecutive at-target ticks before DONE */
 #define STAGGER_TICKS        3U   /* axis i starts i*3 ticks later = 60 ms   */
 #define MOTION_HARD_CAP_MS 15000U /* force-complete window after G; guarantees
                                    the idle-timeout suppression cannot last */
+/* S3 stepping profile (user request 2026-08-26): continuous tracking kept the
+ * loaded elbow hunting even at 7.5 deg/s cruise. Discrete bites instead:
+ * glide S3_STEP_DEG, park S3_DWELL_TICKS, repeat - each setpoint lets the
+ * servo settle dead before the next. Precision >> speed (90 deg ~ 30 s). */
+#define S3_IDX             2U
+#define S3_STEP_DEG        5.0f
+#define S3_DWELL_TICKS     50U   /* x20ms = 1.0 s park between bites */
 
 static uint8_t  motion_done     = 1U;  /* Q query reply state; only G clears */
 static uint32_t move_start_tick = 0U;  /* HAL tick when G was accepted       */
@@ -341,6 +354,8 @@ static void Cmd_Execute(const char *line)
            * vel reset prevents a residual-velocity spike, settled restarts
            * the DONE window. Other axes' trapezoids are untouched. */
           axis[c].target  = t;
+          axis[c].subgoal = t;     /* M jumps whole-hog: no stepping */
+          axis[c].dwell   = 0U;
           axis[c].current = (float)t;
           axis[c].vel     = 0.0f;
           axis[c].settled = 0U;
@@ -391,6 +406,17 @@ static void Cmd_Execute(const char *line)
           if (t < joint_min[gi]) { t = joint_min[gi]; }
           if (t > joint_max[gi]) { t = joint_max[gi]; }
           axis[gi].target  = t;
+          if (gi == S3_IDX)
+          {
+            /* Stepping mode: first bite = one step from CURRENT toward t;
+             * RampStep dwells+advances the rest of the way. */
+            float r = (float)t - axis[gi].current;
+            if (r > S3_STEP_DEG)       { axis[gi].subgoal = (uint16_t)(axis[gi].current + S3_STEP_DEG); }
+            else if (r < -S3_STEP_DEG) { axis[gi].subgoal = (uint16_t)(axis[gi].current - S3_STEP_DEG); }
+            else                       { axis[gi].subgoal = t; }
+          }
+          else { axis[gi].subgoal = t; }
+          axis[gi].dwell   = 0U;
           axis[gi].vel     = 0.0f;   /* G arrives between waypoints (PC waits
                                         for DONE); zeroing vel is predictable */
           axis[gi].settled = 0U;
@@ -425,6 +451,16 @@ static void Cmd_Execute(const char *line)
     for (hi = 0U; hi < 6U; hi++)
     {
       axis[hi].target  = home_servo[hi];
+      if (hi == S3_IDX)
+      {
+        /* Same stepping as G: first bite from current toward HOME */
+        float r = (float)home_servo[hi] - axis[hi].current;
+        if (r > S3_STEP_DEG)       { axis[hi].subgoal = (uint16_t)(axis[hi].current + S3_STEP_DEG); }
+        else if (r < -S3_STEP_DEG) { axis[hi].subgoal = (uint16_t)(axis[hi].current - S3_STEP_DEG); }
+        else                       { axis[hi].subgoal = home_servo[hi]; }
+      }
+      else { axis[hi].subgoal = home_servo[hi]; }
+      axis[hi].dwell   = 0U;
       axis[hi].vel     = 0.0f;
       axis[hi].settled = 0U;
       axis[hi].stagger = 0U;
@@ -556,11 +592,31 @@ void Servo_RampStep(void)
       continue;
     }
 
-    dist = (float)ax->target - ax->current;
+    dist = (float)ax->subgoal - ax->current;
     if (dist < 0.0f) { dist = -dist; }
 
     if (dist < REACH_TOL)
     {
+      float remain = (float)ax->target - (float)ax->subgoal;
+      if ((remain > REACH_TOL) || (remain < -REACH_TOL))
+      {
+        /* parked short of the final target */
+        if (i == S3_IDX)
+        {
+          /* bite edge: dwell out, then advance one step toward target */
+          ax->vel = 0.0f;
+          if (ax->dwell < S3_DWELL_TICKS) { ax->dwell++; all_settled = 0U; continue; }
+          ax->dwell = 0U;
+          if (remain > 0.0f) { ax->subgoal += (remain > S3_STEP_DEG) ? (uint16_t)S3_STEP_DEG : (uint16_t)(remain + 0.5f); }
+          else               { ax->subgoal -= (remain < -S3_STEP_DEG) ? (uint16_t)S3_STEP_DEG : (uint16_t)(-remain + 0.5f); }
+          all_settled = 0U;
+          continue;
+        }
+        /* non-S3 stale subgoal: heal (should not happen) */
+        ax->subgoal = ax->target;
+        all_settled = 0U;
+        continue;
+      }
       ax->vel = 0.0f;
       if (ax->settled < 255U) { ax->settled++; }
       if (ax->settled < SETTLE_TICKS) { all_settled = 0U; }
@@ -583,8 +639,8 @@ void Servo_RampStep(void)
     }
 
     step = (ax->vel < dist) ? ax->vel : dist;               /* no overshoot */
-    if ((float)ax->target >= ax->current) { ax->current += step; }
-    else                                  { ax->current -= step; }
+    if ((float)ax->subgoal >= ax->current) { ax->current += step; }
+    else                                   { ax->current -= step; }
     Servo_SetAngleF(i, ax->current);                        /* float domain: no degree-quantization stall */
   }
 
@@ -599,6 +655,8 @@ void Servo_RampStep(void)
     {
       axis[i].vel     = 0.0f;
       axis[i].settled = SETTLE_TICKS;
+      axis[i].subgoal = axis[i].target;
+      axis[i].dwell   = 0U;
     }
     motion_done = 1U;
   }
