@@ -83,7 +83,7 @@ async function readLoop() {
 async function go() {
   if (!connected) return;
   const a = document.getElementById('slider').value;
-  await writer.write(new TextEncoder().encode('M3 ' + a + '\n'));
+  await writer.write(new TextEncoder().encode('M4 ' + a + '\n'));
 }
 
 async function jump(v) {

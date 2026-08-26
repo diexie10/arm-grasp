@@ -54,9 +54,9 @@
 
 <script>
 const NAMES = ['J1 底座','J2 大臂','J3 小臂','J4 腕俯仰','J5 腕旋转','J6 夹爪'];
-// 固件限位 + HOME（仅用于滑块初始化）
-const LIMITS = [[11,191],[63,183],[5,185],[0,180],[0,135],[0,120]];
-const HOME = [101,93,95,75,90,90];
+// 固件限位 + HOME（仅用于滑块初始化）。S5/S6 校准期保持 0~270 全开
+const LIMITS = [[11,191],[63,183],[5,185],[7,187],[0,270],[0,270]];
+const HOME = [101,93,95,97,90,90];
 const MIN_P = 500, MAX_P = 2500, MAX_A = 180;
 let port, writer, reader, connected = false, buf = '';
 let sel = 0;
