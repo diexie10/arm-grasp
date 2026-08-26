@@ -68,7 +68,12 @@ static ServoAxis axis[6] = {
 };
 
 #define RAMP_TICK_MS       20U    /* x1 = 50 Hz tick, matches servo refresh */
-#define MAX_VEL          0.6f     /* x50   = 30 deg/s  (50% of MG996 60 deg/s) */
+/* Per-axis cruise/crawl caps (deg/tick; x50 = deg/s). One global MAX_VEL=30
+ * deg/s made S3 (elbow, loaded with forearm+wrist) hunt visibly: the command
+ * stream outran its loaded slew (~25-35 deg/s), the servo overshot and
+ * corrected every frame. S3 capped at 20 deg/s = ~70% of loaded slew. */
+static const float max_vel[6] = {0.6f, 0.6f, 0.4f, 0.6f, 0.6f, 0.6f}; /* x50 = 30/30/20/30/30/30 deg/s */
+static const float min_vel[6] = {0.15f, 0.15f, 0.12f, 0.15f, 0.15f, 0.15f}; /* crawl floor; 0.12 deg/tick = 1.33 us/tick pulse, still above deadband */
 #define ACC_PER_TICK     0.006f   /* x2500 = 15 deg/s^2 (50% of max vel)     */
 #define REACH_TOL         0.01f   /* arrival threshold, deg                  */
 #define SETTLE_TICKS         3U   /* consecutive at-target ticks before DONE */
@@ -82,15 +87,15 @@ static uint32_t ramp_tick       = 0U;  /* RampStep pacing                    */
 
 /* Joint angle limits (servo degrees, 0-270 = 0.5-2.5ms PWM on 270-deg servos).
  * Conservative 0-180 band until stage-6 measurement (see docs). */
-static const uint16_t joint_min[6] = {0U, 30U, 10U, 0U, 45U, 30U};
-static const uint16_t joint_max[6] = {180U, 180U, 150U, 180U, 135U, 120U};
+static const uint16_t joint_min[6] = {11U, 3U, 5U, 7U, 0U, 0U};
+static const uint16_t joint_max[6] = {191U, 183U, 167U, 187U, 270U, 270U};
 
 /* Horn-hole compensation (per-axis mechanical trim). Servo horn drilling is
  * imprecise: the link sits true only at a physical angle offset from logical.
  * physical = logical + trim; applied ONLY at pulse conversion, so limits,
  * HOME table and echoes all stay in logical domain. Fill per axis on
  * assembly-day measurement. */
-static const int8_t servo_trim[6] = {-7, 0, 0, 0, 0, 0};
+static const int8_t servo_trim[6] = {-11, -3, -5, -7, 0, 0};
 
 /* Overtravel margin beyond the logical 0..SERVO_MAX_ANGLE band: the servo's
  * mechanical travel extends past the conservative band edge (user-verified),
@@ -106,6 +111,7 @@ static volatile uint32_t last_cmd_tick   = 0U; /* HAL tick of last command    */
 
 /* Private function prototypes -----------------------------------------------*/
 static void Servo_SetAngle(uint8_t ch, uint16_t angle);
+static void Servo_SetAngleF(uint8_t ch, float angle_deg);
 static void Servo_SetAll(uint16_t angle);
 static void Servo_DisableAll(void);
 static uint8_t HexNibble(char c);
@@ -177,6 +183,37 @@ static void Servo_SetAngle(uint8_t ch, uint16_t angle)
   __HAL_TIM_SET_COMPARE(servo_map[ch].tim, servo_map[ch].chan, cmp);
 
   /* Lazy start: only enable PWM on first command for this channel. */
+  if ((servo_enabled[ch] == 0U) && (estop_active == 0U))
+  {
+    servo_enabled[ch] = 1U;
+    HAL_TIM_PWM_Start(servo_map[ch].tim, servo_map[ch].chan);
+  }
+}
+
+/**
+  * @brief  Float-domain PWM write for the ramp: no integer-degree rounding.
+  *         The ramp advances <1 deg/tick near arrival; rounding to whole
+  *         degrees froze the pulse for seconds at a time (quantization stall).
+  * @param  ch         channel index 0..5
+  * @param  angle_deg  fractional servo angle (degrees)
+  */
+static void Servo_SetAngleF(uint8_t ch, float angle_deg)
+{
+  float phys;
+  uint16_t cmp;
+
+  if (ch >= 6U) return;
+
+  /* Same trim + overtravel clamp as Servo_SetAngle, in float. ALL signed:
+   * negative phys must survive to the cmp formula (see trap #27). */
+  phys = angle_deg + (float)servo_trim[ch];
+  if (phys < -(float)TRIM_OVERTRAVEL_DEG)                  { phys = -(float)TRIM_OVERTRAVEL_DEG; }
+  if (phys > (float)SERVO_MAX_ANGLE + (float)TRIM_OVERTRAVEL_DEG) { phys = (float)SERVO_MAX_ANGLE + (float)TRIM_OVERTRAVEL_DEG; }
+  cmp = (uint16_t)((float)SERVO_MIN_PULSE +
+        phys * ((float)SERVO_MAX_PULSE - (float)SERVO_MIN_PULSE) / (float)SERVO_MAX_ANGLE);
+
+  __HAL_TIM_SET_COMPARE(servo_map[ch].tim, servo_map[ch].chan, cmp);
+
   if ((servo_enabled[ch] == 0U) && (estop_active == 0U))
   {
     servo_enabled[ch] = 1U;
@@ -381,7 +418,7 @@ static void Cmd_Execute(const char *line)
   }
   else if ((line[0] == 'H') || (line[0] == 'h'))
   {
-    static const uint16_t home_servo[6] = {90U, 135U, 60U, 75U, 90U, 90U};
+    static const uint16_t home_servo[6] = {101U, 122U, 167U, 97U, 90U, 90U}; /* 悬停位: 大臂122 小臂167 */
     uint8_t hi;
     uint8_t was_estop = estop_active;
     estop_active = 0U;
@@ -537,18 +574,18 @@ void Servo_RampStep(void)
     decel_dist = (ax->vel * ax->vel) / (2.0f * ACC_PER_TICK);
     if (dist > decel_dist)
     {
-      if (ax->vel < MAX_VEL) { ax->vel += ACC_PER_TICK; }   /* accel / cruise */
+      if (ax->vel < max_vel[i]) { ax->vel += ACC_PER_TICK; }   /* accel / cruise */
     }
     else
     {
       ax->vel -= ACC_PER_TICK;                              /* decelerate */
-      if (ax->vel < ACC_PER_TICK) { ax->vel = ACC_PER_TICK; } /* crawl floor */
+      if (ax->vel < min_vel[i]) { ax->vel = min_vel[i]; }   /* crawl floor above deadband */
     }
 
     step = (ax->vel < dist) ? ax->vel : dist;               /* no overshoot */
     if ((float)ax->target >= ax->current) { ax->current += step; }
     else                                  { ax->current -= step; }
-    Servo_SetAngle(i, (uint16_t)(ax->current + 0.5f));
+    Servo_SetAngleF(i, ax->current);                        /* float domain: no degree-quantization stall */
   }
 
   motion_done = all_settled;
