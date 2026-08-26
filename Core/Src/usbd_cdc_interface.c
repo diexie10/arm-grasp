@@ -88,11 +88,24 @@ static const float min_vel[6] = {0.15f, 0.15f, 0.15f, 0.15f, 0.15f, 0.15f}; /* c
                                    the idle-timeout suppression cannot last */
 /* S3 stepping profile (user request 2026-08-26): continuous tracking kept the
  * loaded elbow hunting even at 7.5 deg/s cruise. Discrete bites instead:
- * glide S3_STEP_DEG, park S3_DWELL_TICKS, repeat - each setpoint lets the
- * servo settle dead before the next. Precision >> speed (90 deg ~ 30 s). */
+ * glide, park S3_DWELL_TICKS, repeat - each setpoint lets the servo settle
+ * dead before the next. Precision >> speed. Adaptive bite width: 15 deg
+ * mid-travel, 10 deg approach, 5 deg final (user-tuned). */
 #define S3_IDX             2U
-#define S3_STEP_DEG        5.0f
+#define S3_STEP_NEAR_DEG   5.0f
+#define S3_STEP_MID_DEG    10.0f
+#define S3_STEP_FAR_DEG    15.0f
+#define S3_BITE_FAR_THR    20.0f  /* remaining above -> FAR bite */
+#define S3_BITE_MID_THR    10.0f  /* remaining above -> MID bite */
 #define S3_DWELL_TICKS     50U   /* x20ms = 1.0 s park between bites */
+
+/* Bite width by remaining distance. Distances not rates - no multiply-back. */
+static float S3_BiteSize(float remain_abs)
+{
+  if (remain_abs > S3_BITE_FAR_THR) { return S3_STEP_FAR_DEG; }
+  if (remain_abs > S3_BITE_MID_THR) { return S3_STEP_MID_DEG; }
+  return S3_STEP_NEAR_DEG;
+}
 
 static uint8_t  motion_done     = 1U;  /* Q query reply state; only G clears */
 static uint32_t move_start_tick = 0U;  /* HAL tick when G was accepted       */
@@ -408,12 +421,14 @@ static void Cmd_Execute(const char *line)
           axis[gi].target  = t;
           if (gi == S3_IDX)
           {
-            /* Stepping mode: first bite = one step from CURRENT toward t;
-             * RampStep dwells+advances the rest of the way. */
+            /* Stepping mode: first bite = one adaptive step from CURRENT
+             * toward t; RampStep dwells+advances the rest of the way. */
             float r = (float)t - axis[gi].current;
-            if (r > S3_STEP_DEG)       { axis[gi].subgoal = (uint16_t)(axis[gi].current + S3_STEP_DEG); }
-            else if (r < -S3_STEP_DEG) { axis[gi].subgoal = (uint16_t)(axis[gi].current - S3_STEP_DEG); }
-            else                       { axis[gi].subgoal = t; }
+            float ra = (r > 0.0f) ? r : -r;
+            float b  = S3_BiteSize(ra);
+            if (r > b)       { axis[gi].subgoal = (uint16_t)(axis[gi].current + b); }
+            else if (r < -b) { axis[gi].subgoal = (uint16_t)(axis[gi].current - b); }
+            else             { axis[gi].subgoal = t; }
           }
           else { axis[gi].subgoal = t; }
           axis[gi].dwell   = 0U;
@@ -453,11 +468,13 @@ static void Cmd_Execute(const char *line)
       axis[hi].target  = home_servo[hi];
       if (hi == S3_IDX)
       {
-        /* Same stepping as G: first bite from current toward HOME */
-        float r = (float)home_servo[hi] - axis[hi].current;
-        if (r > S3_STEP_DEG)       { axis[hi].subgoal = (uint16_t)(axis[hi].current + S3_STEP_DEG); }
-        else if (r < -S3_STEP_DEG) { axis[hi].subgoal = (uint16_t)(axis[hi].current - S3_STEP_DEG); }
-        else                       { axis[hi].subgoal = home_servo[hi]; }
+        /* Same adaptive stepping as G: first bite from current toward HOME */
+        float r  = (float)home_servo[hi] - axis[hi].current;
+        float ra = (r > 0.0f) ? r : -r;
+        float b  = S3_BiteSize(ra);
+        if (r > b)       { axis[hi].subgoal = (uint16_t)(axis[hi].current + b); }
+        else if (r < -b) { axis[hi].subgoal = (uint16_t)(axis[hi].current - b); }
+        else             { axis[hi].subgoal = home_servo[hi]; }
       }
       else { axis[hi].subgoal = home_servo[hi]; }
       axis[hi].dwell   = 0U;
@@ -607,8 +624,12 @@ void Servo_RampStep(void)
           ax->vel = 0.0f;
           if (ax->dwell < S3_DWELL_TICKS) { ax->dwell++; all_settled = 0U; continue; }
           ax->dwell = 0U;
-          if (remain > 0.0f) { ax->subgoal += (remain > S3_STEP_DEG) ? (uint16_t)S3_STEP_DEG : (uint16_t)(remain + 0.5f); }
-          else               { ax->subgoal -= (remain < -S3_STEP_DEG) ? (uint16_t)S3_STEP_DEG : (uint16_t)(-remain + 0.5f); }
+          {
+            float r_abs = (remain > 0.0f) ? remain : -remain;
+            float bite  = S3_BiteSize(r_abs);
+            if (remain > 0.0f) { ax->subgoal += (r_abs > bite) ? (uint16_t)bite : (uint16_t)(r_abs + 0.5f); }
+            else               { ax->subgoal -= (r_abs > bite) ? (uint16_t)bite : (uint16_t)(r_abs + 0.5f); }
+          }
           all_settled = 0U;
           continue;
         }
