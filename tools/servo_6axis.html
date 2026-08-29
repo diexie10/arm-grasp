@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>6轴机械臂控制台</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'SF Mono', 'Fira Code', monospace; background: #0a0a1a; color: #c8d6e5; padding: 12px; }
+  h1 { text-align: center; color: #48dbfb; font-size: 1.2em; margin-bottom: 10px; letter-spacing: 2px; }
+  .top { display: flex; gap: 8px; justify-content: center; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+  .top button { padding: 6px 14px; border: none; border-radius: 6px; font-size: 0.85em; cursor: pointer; font-weight: 600; }
+  #btnConn { background: #48dbfb; color: #0a0a1a; }
+  #btnConn.on { background: #ee5a24; }
+  #status { color: #576574; font-size: 0.8em; max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; max-width: 850px; margin: 0 auto 10px; }
+  .card { background: #1e272e; border-radius: 8px; padding: 10px; border: 1px solid #2c3e50; }
+  .card h3 { color: #48dbfb; font-size: 0.85em; margin-bottom: 4px; }
+  .row { display: flex; align-items: center; gap: 6px; margin: 3px 0; }
+  .row input[type=range] { flex: 1; accent-color: #48dbfb; height: 4px; }
+  .row .v { min-width: 36px; text-align: right; color: #48dbfb; font-size: 0.95em; }
+  .row .pw { min-width: 50px; text-align: right; color: #576574; font-size: 0.7em; }
+  .row .lim { font-size: 0.65em; color: #636e72; }
+  .actions { display: flex; gap: 6px; justify-content: center; margin-bottom: 10px; flex-wrap: wrap; }
+  .actions button { padding: 8px 16px; border: none; border-radius: 6px; font-size: 0.85em; cursor: pointer; font-weight: 600; }
+  .btnG { background: #10ac84; color: #fff; }
+  .btnH { background: #48dbfb; color: #0a0a1a; }
+  .btnE { background: #ee5a24; color: #fff; }
+  .btnQ { background: #576574; color: #fff; }
+  .btnS { background: #576574; color: #fff; }
+  .btnR { background: #2c3e50; color: #c8d6e5; }
+  #log { max-width: 850px; margin: 0 auto; background: #0d1117; border-radius: 6px; padding: 6px; font-size: 0.75em; max-height: 100px; overflow-y: auto; color: #636e72; }
+  #log .s { color: #48dbfb; } #log .r { color: #10ac84; }
+  .kbd { font-size: 0.65em; color: #576574; text-align: center; margin-top: 6px; }
+</style>
+</head>
+<body>
+<h1>⚙ 6-AXIS ARM</h1>
+<div class="top">
+  <button id="btnConn" onclick="toggle()">连接</button>
+  <span id="status">未连接</span>
+</div>
+<div class="grid" id="grid"></div>
+<div class="actions">
+  <button class="btnG" onclick="sendG()" title="G 滑行（空格键）">▶ G 滑行</button>
+  <button class="btnH" onclick="sendCmd('H')" title="H 归中">H 归中</button>
+  <button class="btnE" onclick="sendCmd('E')" title="E 急停">⏹ E 急停</button>
+  <button class="btnR" onclick="resetSliders()" title="滑块归位">↺ 滑块归位</button>
+  <button class="btnQ" onclick="sendCmd('Q')" title="Q 查状态">Q</button>
+  <button class="btnS" onclick="sendCmd('S')" title="S 查角度">S</button>
+</div>
+<div id="log"></div>
+<div class="kbd">1-6 选轴 · ← → 微调1° · 空格=G滑行 · H归中 · E急停</div>
+
+<script>
+const NAMES = ['J1 底座','J2 大臂','J3 小臂','J4 腕俯仰','J5 腕旋转','J6 夹爪'];
+// 固件限位 + HOME（悬停位）。S5/S6 校准期保持 0~270 全开
+const LIMITS = [[11,191],[3,183],[5,167],[7,187],[0,270],[0,270]];
+const HOME = [101,122,167,97,90,90];
+const MIN_P = 500, MAX_P = 2500, MAX_A = 180;
+let port, writer, reader, connected = false, buf = '';
+let sel = 0;
+
+function pw(a) { return Math.round(MIN_P + a * (MAX_P - MIN_P) / MAX_A); }
+
+// 构建 6 轴卡片（滑块限位=固件限位）
+const g = document.getElementById('grid');
+for (let i = 0; i < 6; i++) {
+  const [lo, hi] = LIMITS[i];
+  const c = document.createElement('div');
+  c.className = 'card';
+  c.innerHTML = `
+    <h3>S${i+1} ${NAMES[i]} <span class="lim">[${lo}~${hi}]</span></h3>
+    <div class="row">
+      <input type=range id="s${i}" min="${lo}" max="${hi}" value="${HOME[i]}" step=1
+             oninput="uv(${i})" onclick="sel=${i}">
+      <span class=v id="v${i}">${HOME[i]}°</span>
+      <span class=pw id="p${i}">${pw(HOME[i])}µs</span>
+    </div>`;
+  g.appendChild(c);
+}
+
+function uv(i) {
+  const a = +document.getElementById('s'+i).value;
+  document.getElementById('v'+i).textContent = a + '°';
+  document.getElementById('p'+i).textContent = pw(a) + 'µs';
+}
+
+// 滑块全部归位到 HOME
+function resetSliders() {
+  for (let i = 0; i < 6; i++) {
+    document.getElementById('s'+i).value = HOME[i];
+    uv(i);
+  }
+}
+
+// 连接
+async function toggle() {
+  if (connected) { reader?.cancel(); port?.close(); connected = false;
+    document.getElementById('btnConn').textContent = '连接';
+    document.getElementById('btnConn').classList.remove('on');
+    document.getElementById('status').textContent = '已断开'; return; }
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    const dec = new TextDecoderStream();
+    reader = port.readable.pipeThrough(dec).getReader();
+    writer = port.writable.getWriter();
+    connected = true;
+    document.getElementById('btnConn').textContent = '断开';
+    document.getElementById('btnConn').classList.add('on');
+    document.getElementById('status').textContent = '已连接';
+    readLoop();
+  } catch (e) { document.getElementById('status').textContent = '失败: ' + e.message; }
+}
+
+async function readLoop() {
+  while (connected) {
+    try {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += value;
+      let idx;
+      while ((idx = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, idx).trim();
+        buf = buf.slice(idx + 1);
+        if (line) log(line, 'r');
+      }
+    } catch (e) { break; }
+  }
+}
+
+async function sendCmd(cmd) {
+  if (!connected) return;
+  await writer.write(new TextEncoder().encode(cmd + '\n'));
+  log('> ' + cmd, 's');
+}
+
+async function sendG() {
+  const vals = [];
+  for (let i = 0; i < 6; i++) vals.push(document.getElementById('s'+i).value);
+  await sendCmd('G ' + vals.join(' '));
+}
+
+// 键盘
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  const s = document.getElementById('s' + sel);
+  switch (e.key) {
+    case '1':case '2':case '3':case '4':case '5':case '6':
+      sel = +e.key - 1; document.getElementById('s'+sel).focus(); break;
+    case 'ArrowLeft': s.value = Math.max(+s.min, +s.value - 1); uv(sel); break;
+    case 'ArrowRight': s.value = Math.min(+s.max, +s.value + 1); uv(sel); break;
+    case ' ': e.preventDefault(); sendG(); break;
+    case 'h': case 'H': sendCmd('H'); break;
+    case 'e': case 'E': sendCmd('E'); break;
+  }
+});
+
+function log(t, cls) {
+  const el = document.getElementById('log');
+  const d = document.createElement('div');
+  d.className = cls || ''; d.textContent = t;
+  el.appendChild(d); el.scrollTop = el.scrollHeight;
+  while (el.children.length > 100) el.removeChild(el.firstChild);
+}
+</script>
+</body>
+</html>
