@@ -37,6 +37,10 @@
 | 关节限位值实测校准 | 固件 joint_min/max 表 | 推测值待实测 | 机械臂到货 | 实测机械限位后改表 |
 | IK 连杆参数实测标定 | config.py | 推测值待实测 | 机械臂到货 | 实测后改 config |
 | 软启动（逐舵机使能 200ms） | arm_serial.soft_start | ✅ 实现 | 固件 | DRY_RUN 通过；真机观察 |
+| 对齐环 wrist-first 分层（粗层死区 / J4-slack 微调 / 升级计数器 / 粗层最小步距） | servo_controller.py + state_machine.py + config.py | 2026-09-06 实现，**参数为预置默认待实测** | 虚位量化（阶段 6 第 7 项）+ J4-slack 视觉容忍度（阶段 8 第 5 项） | 末端无持续抖动（极限环消失）；腕层饱和/停滞正确升级粗层；粗层不再发 <3° 小步 |
+| dwell 按峰速缩放（近端小 bite 短停） | 固件 servo.c | 未开始（待实测数据） | 每 bite 稳定时间实测（阶段 6 第 8 项） | 大摆时间缩短且末端无新增抖动 |
+| J5 横向微调（横向 xy 小误差走腕层） | servo_controller.py | 未开始 | J5 偏轴量实测（阶段 8 第 6 项） | 若 WRIST_LATERAL_MM_PER_DEG>0，横向小误差由 J5 承担 |
+| IK 目标语义修正（腕点 vs 爪尖） | kinematics.py | 未开始 | 装机日第 0 项实测（阶段 6 第 5 项） | 语义锁定或 L4 入模；低 z 结论重审 |
 | 日志系统 | main.py + logging | ✅ 实现 | 状态机 | 每次状态转换有记录 |
 
 ---

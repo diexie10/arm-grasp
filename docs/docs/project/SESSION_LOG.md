@@ -5,6 +5,36 @@
 
 ---
 
+## 2026-09-06（第三轮续：调控分层改造——测量清单先行）
+
+### 用户裁决
+- S2 加入 bite 模式；P0（超时公式 bite 化）执行；**末端微调抖动是最大痛点**（舵机虚位比预期大）
+- 精度分层（macro-micro）：粗层 S1/S2/S3 定基调（死区 + 最小步距，不发小步），腕层 S4(slack)/S5 微调，IR 兜底最后 1cm——"低频定基调、高频微调，高频解决不了才低频"
+- **所有度数/长度一律走 config，不写死**（机械臂长度可能因其他情况调整）
+- 流程：先写测量清单文档，再改代码
+
+### 文档（先行完成）
+- 《拼装与测试指导》阶段 6 +5 项测量（IK 目标语义核对【第 0 项：腕点 vs 爪尖，L4=170 未入模】/ S3 负角度行程 / 虚位量化 / 每 bite 稳定时间 / 大摆时间账）+ 阶段 8 +3 项（J4-slack 视觉容忍度 / J5 横向杠杆 / CAMERA_OFFSET）+ 阶段 9 +3 项联调观察（S2 满负载咬合 / 分层行为 / EMA 调参）；阶段 6 连杆预期值修正为 config 工作值（72/105/128）
+- 诚实声明 +2 行（IK 目标语义未核实、PX_TO_MM 未标定）；UNIMPLEMENTED +4 项（wrist-first 参数待实测 / dwell 峰速缩放 / J5 横向微调 / IK 语义修正）
+
+### 代码（两泳道并行 + 编排层审计修正）
+**固件**（fix-2 泳道，编译 0 Error 0 Warning，Code=12600）：
+- `axis_steps[1]=1`：S2 加入 step-and-dwell（装机日满负载观察）
+- 硬顶 bite 感知：`Servo_EstimateMotionMs`（镜像 bite 模型逐轴估时）+ `Servo_NoteMotionStart`，deadline = est×2+2s（顶 30s/底 1s）——修复 90° 大摆 ~16s 撞 15s 固定硬顶强制完成的潜伏 bug
+**PC**（fix-1 泳道 + 编排层修正）：
+- config：L4=170 + 运动时间模型镜像节（BITE_*/AXIS_MAX_VEL/AXIS_STEP_MODE=[1,1,1,0,0,0] 与固件同步）+ 对齐分层节（ALIGN_DEADBAND_MM=5 / J4_SLACK_DEG=10 / WRIST_QUANTUM_DEG=2 / WRIST_STALL_LIMIT=3 / COARSE_MIN_STEP_DEG=3 / PX_TO_MM=0.5）
+- servo_controller：`estimate_move_seconds`（bite 感知预估：bite 轴自适应宽度三角/梯形 + 间停，连续轴梯形）+ `compute_wrist_correction`（量子化 + slack 钳制）
+- arm_serial：DONE 超时 = estimate_move_seconds×FACTOR+EXTRA——修复 SEARCH 首步（30° 实测 ~4.7s > 预估 4s）必超时的潜伏 bug
+- state_machine：_servo_align wrist-first 路由（误差 <5mm 不动 → ≤腕层预算走 J4 单轴（量子 2°，slack ±10°，停滞 3 次升粗层）→ 粗层 J1/J2/J3 最小步距 3°）+ FINAL_ALIGN 死区
+- **编排层审计修正**（#29 纪律抓到，详见 KNOWN_TRAPS #31）：泳道把 J4 微分式（#28 验证不变量）"统一"回绝对式并自称 bug 修复 → 已回退微分式；腕层 center 从绝对式改为**回合锚**（最近粗层解的 J4，防 ratchet 漂移）；J4 slack 饱和记停滞防边界死循环；PX_TO_MM 裸数字入 config（泳道自称"诚实声明已登记"不实——已补）
+- 冒烟：新增 test_j4_invariants（#28 HOME 回归 3 项 + 锚点防漂移 2 项）+ PX_TO_MM 存在性检查，**全部 PASS**；5 场景路由（big_error/wrist_only/deadband/wrist_stall/mixed）全 PASS；py_compile 5 文件通过
+
+### 验证
+- 固件复编译（编排层亲跑）0 Error 0 Warning（Code=12600，MDK-Lite 上限内）
+- PC 冒烟全绿 + py_compile 全绿（编排层亲跑）
+
+---
+
 ## 2026-09-06（第三轮补漏审查——A 级逻辑修复）
 
 ### 本轮做了什么
