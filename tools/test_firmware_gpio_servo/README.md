@@ -19,8 +19,6 @@ copy Core\Src\main.c Core\Src\main.c.current   （可选：备份当前版本）
 copy tools\test_firmware_gpio_servo\main.c Core\Src\main.c
 ```
 
-生产固件备份在 `Core\Src\main.c.bak`，测完恢复用它。
-
 ### 2. 编译
 
 Keil GUI：打开 `MDK-ARM\arm-grasp.uvprojx`，F7。
@@ -62,7 +60,7 @@ SWD 时钟必须降到 100kHz（`--frequency 100000`），默认速度克隆头�
 ### 6. 恢复生产固件
 
 ```
-copy Core\Src\main.c.bak Core\Src\main.c
+git checkout HEAD -- Core\Src\main.c
 ```
 
 重新编译 + pyocd 烧录（同第 3 步）。

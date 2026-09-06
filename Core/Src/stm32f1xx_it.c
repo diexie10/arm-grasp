@@ -42,7 +42,9 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN PV */
-
+/* Debug: ORE (overrun) counter — incremented when USART3 RX byte is lost.
+ * Read and clear manually during debugging; not used by any logic. */
+static volatile uint32_t uart3_ore_count = 0U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -210,7 +212,14 @@ void USART3_IRQHandler(void)
     uint8_t byte = (uint8_t)(USART3->DR & 0xFFU);
     UART_RxByte(byte);
   }
-  /* ORE is cleared by reading SR then DR (done above). */
+  /* ORE (overrun error): set when RXNE was not read before next byte arrived.
+   * Cleared by reading SR then DR (done above). Count for debug observation;
+   * reset manually after reading. */
+  if ((USART3->SR & USART_SR_ORE) != 0U)
+  {
+    (void)USART3->DR;  /* clear ORE by reading DR */
+    uart3_ore_count++;
+  }
 }
 
 /* USER CODE BEGIN 1 */

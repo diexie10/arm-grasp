@@ -59,6 +59,7 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_TIM2_Init(void);
+static void MX_TIMx_PWM_Init(TIM_HandleTypeDef *htim);
 static void MX_IWDG_Init(void);
 static void MX_USART3_UART_Init(void);
 void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
@@ -181,22 +182,21 @@ void SystemClock_Config(void)
 }
 
 /**
-  * @brief TIM1 Initialization Function (servos 1-3 on PA8/PA9/PA10)
-  * @param None
-  * @retval None
+  * @brief  Shared PWM init for TIM1/TIM2: prescaler, period, 3 channels,
+  *         MspPostInit. Called by MX_TIM1_Init / MX_TIM2_Init.
+  * @param  htim  pointer to timer handle (Instance must be set by caller)
   */
-static void MX_TIM1_Init(void)
+static void MX_TIMx_PWM_Init(TIM_HandleTypeDef *htim)
 {
   TIM_OC_InitTypeDef sConfigOC = {0};
 
-  htim1.Instance = TIM1;
-  htim1.Init.Prescaler = 71;
-  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim1.Init.Period = 19999;
-  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim1.Init.RepetitionCounter = 0;
-  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
+  htim->Init.Prescaler = SERVO_TIM_PSC;
+  htim->Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim->Init.Period = SERVO_TIM_ARR;
+  htim->Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim->Init.RepetitionCounter = 0;
+  htim->Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_PWM_Init(htim) != HAL_OK)
   {
     Error_Handler();
   }
@@ -205,20 +205,31 @@ static void MX_TIM1_Init(void)
   sConfigOC.Pulse = SERVO_HOME_PULSE;  /* 1166 us = 90 deg on 270-deg servos */
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  if (HAL_TIM_PWM_ConfigChannel(htim, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
   {
     Error_Handler();
   }
-  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  if (HAL_TIM_PWM_ConfigChannel(htim, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
   {
     Error_Handler();
   }
-  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
+  if (HAL_TIM_PWM_ConfigChannel(htim, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
   {
     Error_Handler();
   }
 
-  HAL_TIM_MspPostInit(&htim1);
+  HAL_TIM_MspPostInit(htim);
+}
+
+/**
+  * @brief TIM1 Initialization Function (servos 1-3 on PA8/PA9/PA10)
+  * @param None
+  * @retval None
+  */
+static void MX_TIM1_Init(void)
+{
+  htim1.Instance = TIM1;
+  MX_TIMx_PWM_Init(&htim1);
 }
 
 /**
@@ -228,37 +239,8 @@ static void MX_TIM1_Init(void)
   */
 static void MX_TIM2_Init(void)
 {
-  TIM_OC_InitTypeDef sConfigOC = {0};
-
   htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 71;
-  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 19999;
-  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-  if (HAL_TIM_PWM_Init(&htim2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = SERVO_HOME_PULSE;  /* 1166 us = 90 deg on 270-deg servos */
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  HAL_TIM_MspPostInit(&htim2);
+  MX_TIMx_PWM_Init(&htim2);
 }
 
 /**
@@ -274,8 +256,8 @@ static void MX_IWDG_Init(void)
   IWDG->KR = IWDG_KEY_UNLOCK;
   /* Prescaler 128 (IWDG_PR_PR_2 = 0x4) */
   IWDG->PR = IWDG_PR_PR_2;
-  /* Reload value 625 -> ~2.0 s */
-  IWDG->RLR = 625U;
+  /* Reload value -> ~2.0 s */
+  IWDG->RLR = IWDG_RLR_2S;
   /* Start the watchdog */
   IWDG->KR = IWDG_KEY_START;
 }
@@ -346,6 +328,11 @@ void Error_Handler(void)
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
+  /* NOTE: IWDG is still running (~2 s timeout). The MCU will reset shortly
+   * with no crash log or trace — the watchdog just fires and restarts.
+   * To debug: set a breakpoint here, or check RCC_CSR for reset source
+   * (IWDG reset sets SFTRSTF). On re-entry the firmware reinitializes
+   * cleanly, so the fault cause is lost unless captured before reset. */
   while (1)
   {
   }

@@ -419,9 +419,19 @@
               <FilePath>../Core/Src/usbd_desc.c</FilePath>
             </File>
             <File>
-              <FileName>usbd_cdc_interface.c</FileName>
+              <FileName>ring.c</FileName>
               <FileType>1</FileType>
-              <FilePath>../Core/Src/usbd_cdc_interface.c</FilePath>
+              <FilePath>../Core/Src/ring.c</FilePath>
+            </File>
+            <File>
+              <FileName>servo.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/servo.c</FilePath>
+            </File>
+            <File>
+              <FileName>cmd.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/cmd.c</FilePath>
             </File>
           </Files>
         </Group>
