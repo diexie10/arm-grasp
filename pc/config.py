@@ -52,6 +52,9 @@ LIMIT_EPS = 1e-6             # 限位预检浮点容差（arm_serial.move_joint 
 L1 = 72.0    # 底座高度（J1 轴心到 J2 轴心）mm —— 官方参数，拼装后实测复核
 L2 = 105.0   # 大臂长度（J2 到 J3）mm —— 官方参数，拼装后实测复核
 L3 = 128.0   # 小臂长度（J3 到 J4）mm —— 官方参数，拼装后实测复核
+L4 = 170.0   # J4→爪尖（含手爪旋转舵机）mm —— 官方参数，拼装后实测复核。
+             # IK 目标语义（腕点 vs 爪尖）待装机日第 0 项核实（docs/拼装与测试指导.md
+             # 阶段 6 第 5 项）。本值仅用于腕层微调位移换算（L4·sin(1°)→mm/°）。
 J5_FIXED = 0.0               # 腕旋转中立（关节角 0 → 舵机 90°）
 J5_ALIGN_ENABLED = False     # J5=θ−J1 夹爪朝向对齐：θ 符号/象限未实测标定，
                              # 且 θ−J1 极易超出 J5 限位[-45,45]，实测前禁用
@@ -70,6 +73,33 @@ SETTLE_MS = 300              # 到位稳定时间
 GRIP_WAIT_MS = 200           # 夹爪闭合后等待，再抬升
 RELEASE_WAIT_MS = 300        # 夹爪张开后等待
 SOFTSTART_INTERVAL = 0.2     # 软启动逐个使能间隔 s
+
+# ===================== 运动时间模型（固件 servo.c 宏镜像） =====================
+# 跨端手动同步责任：PC 用这些参数预估 DONE 超时；固件用对应宏执行运动。
+# 装机日按 docs/拼装与测试指导.md 阶段 6 第 8/9 项实测校准。
+# bite 轴（axis_steps=1）：每 bite 滑动 Δ°，边沿 vel=0 重新起速（加速度 a）。
+# 连续轴（axis_steps=0）：匀速 vmax，无 bite 停顿。
+BITE_FAR_DEG = 15.0          # 大位移 bite 宽度 °
+BITE_MID_DEG = 10.0          # 中位移 bite 宽度 °
+BITE_NEAR_DEG = 5.0          # 小位移 bite 宽度 °
+BITE_FAR_THR = 20.0          # Δ > 此值用 FAR bite
+BITE_MID_THR = 10.0          # Δ > 此值用 MID bite，否则 NEAR
+BITE_DWELL_S = 0.66          # bite 间停顿 s（STEP_DWELL_TICKS 33 × 20ms）
+BITE_ACC_DEG_S2 = 15.0       # bite 加速度 °/s²（ACC_PER_TICK 0.006 × 2500）
+AXIS_MAX_VEL = [30.0, 30.0, 7.5, 30.0, 30.0, 30.0]  # 各轴最大速度 °/s（servo.c max_vel 镜像）
+AXIS_STEP_MODE = [1, 1, 1, 0, 0, 0]  # 0=连续 1=bite（servo.c axis_steps 镜像，含 S2 开启）
+# 旧 MAX_VEL 仍被 trajectory.py 引用（消隙过冲估算），保留并注明：
+# MAX_VEL 语义 = bite 轴等效平均速度上限，与 AXIS_MAX_VEL[0] 一致。
+
+# ===================== 对齐分层（wrist-first，预置默认待装机日标定） =====================
+# 误差路由：deadband → 腕层(J4) → 粗层(J1/J2/J3)。
+# 腕层 mm/° 不做 config 常量——使用处由 L4 推导（L4·sin(1°)），长度改了自动跟随。
+ALIGN_DEADBAND_MM = 5.0      # 误差 < 此值 → 本轮不动（收敛判定不变）
+J4_SLACK_DEG = 10.0          # J4 相对 center 的最大偏移 °（center=回合锚=最近粗层解的 J4）
+WRIST_QUANTUM_DEG = 2.0      # J4 修正量化步长 °（连续轴无 bite，但量化防微抖）
+WRIST_STALL_LIMIT = 3        # 连续腕修正误差未下降 → 升粗层的次数阈值
+COARSE_MIN_STEP_DEG = 3.0    # 粗层非零关节 delta 最小值 °（> 死区，防极限环）
+PX_TO_MM = 0.5               # 像素→毫米粗略换算（未标定预置；装机日标定板实测回填）
 
 # ===================== 视觉 =====================
 YOLO_MODEL = r"C:\Users\diexie\Desktop\arm-grasp\pc\models\best.pt"

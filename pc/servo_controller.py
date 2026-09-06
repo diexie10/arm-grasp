@@ -6,10 +6,14 @@
   - EMA 状态（ema_cx/ema_cy）
   - _align_delta 的 dq0/dq12 数学（含限幅 clamp 引用 + J4 微分约束）
   - 六轴限位检查 helper
+  - 运动时间估算（镜像 servo.c bite 模型，跨端同步责任）
+  - 腕层 J4 修正 helper（量子化 + slack 钳制）
 
 接口设计：输入纯数值（像素误差/帧尺寸/关节角列表），输出增量或判定。
 不 import pyserial/cv2，不持有 serial/vision 引用。
 """
+
+import math
 
 import config
 from kinematics import clamp
@@ -84,12 +88,18 @@ class ServoController:
         return dq0, dq12
 
     def apply_joint_deltas(self, q_start, dq0, dq12):
-        """应用关节增量到起始关节角，含 J4 微分约束。
+        """应用关节增量到起始关节角，含 J4 微分约束（#28）。
+
+        竖直约束微分形式：ΔJ4 = −ΔJ2 − ΔJ3 = −2·dq12（dq12=0 不碰 J4）。
+        不用绝对式 90−J2−J3：其零位参考是真机标定项（KNOWN_TRAPS #28），
+        标定前绝对式会把校准好的 HOME 姿态拉到非法值
+        （实测复现：90−122−167=−199 → ALIGN 首步即 ERROR）。
+        J1（基座回转）不参与竖直俯仰约束——J4 公式与 dq0 无关。
 
         Args:
             q_start: 起始关节角列表 [6]
             dq0: J1 水平增量
-            dq12: J2/J3 垂直增量（J4 = -2*dq12）
+            dq12: J2/J3 公共垂直增量（ΔJ2=ΔJ3=dq12）
 
         Returns:
             q_new: 更新后的关节角列表
@@ -109,3 +119,98 @@ class ServoController:
                 return False, ("%s: joint %d out of range %.1f"
                                % (state_label, i + 1, q[i]))
         return True, None
+
+
+# =====================================================================
+#  纯函数（无状态，无 I/O）——供 servo_controller 自身 + state_machine 调用
+# =====================================================================
+
+def estimate_move_seconds(from_q, to_q):
+    """估算六轴运动耗时（镜像 servo.c bite 模型，跨端同步责任）。
+
+    bite 轴（AXIS_STEP_MODE[i]==1）：自适应 bite 序列，每 bite 从静止起速。
+      Δ > BITE_FAR_THR → bite=BITE_FAR_DEG；> BITE_MID_THR → MID；否则 NEAR。
+      每 bite 滑动时间：峰值 v=sqrt(a·b)≤vmax 时 t=2·sqrt(b/a)，
+      否则 t=b/vmax+vmax/a（梯形）。n_bites=ceil(Δ/b)，间停 (n-1)·DWELL。
+    连续轴（AXIS_STEP_MODE[i]==0）：t=Δ/vmax+vmax/a（梯形速度剖面）。
+    六轴取 max，加 SETTLE 余量。
+
+    Args:
+        from_q: 起始关节角列表 [6]（°）
+        to_q:   目标关节角列表 [6]（°）
+
+    Returns:
+        float 预估运动秒数（≥ 0）
+    """
+    a = config.BITE_ACC_DEG_S2
+    _SETTLE = 0.2  # settle 余量 s（并入调用方 EXTRA 或独立使用）
+
+    max_t = 0.0
+    for i in range(6):
+        delta = abs(to_q[i] - from_q[i])
+        if delta < 1e-6:
+            continue
+        vmax = config.AXIS_MAX_VEL[i]
+        if config.AXIS_STEP_MODE[i] == 0:
+            # 连续轴：梯形速度剖面 t = Δ/vmax + vmax/a
+            t = delta / vmax + vmax / a
+        else:
+            # bite 轴：自适应 bite 宽度
+            if delta > config.BITE_FAR_THR:
+                b = config.BITE_FAR_DEG
+            elif delta > config.BITE_MID_THR:
+                b = config.BITE_MID_DEG
+            else:
+                b = config.BITE_NEAR_DEG
+            n_bites = max(1, int(delta / b + 0.999))  # ceil
+            # 每 bite 滑动时间（从静止起速）
+            v_peak = (a * b) ** 0.5
+            if v_peak <= vmax:
+                t_bite = 2.0 * (b / a) ** 0.5  # 三角形：2·sqrt(b/a)
+            else:
+                t_bite = b / vmax + vmax / a    # 梯形
+            t = n_bites * t_bite + max(0, n_bites - 1) * config.BITE_DWELL_S
+        if t > max_t:
+            max_t = t
+    return max_t + _SETTLE
+
+
+def compute_wrist_correction(err_mm, q_current, center=None):
+    """计算 J4 腕层修正量（量子化 + slack 钳制）。
+
+    center = J4 回合锚点：最近一次粗层（IK）解设定的 J4 值，腕层相对它
+    钳制 slack。**不用绝对式 90−J2−J3**——其零位参考是真机标定项
+    （KNOWN_TRAPS #28，HOME 处给出 −199 非法中心）。腕修正期间
+    q1/q2/q3 静止、center 不漂移；粗层介入后调用方置 center=None 重锚。
+
+    方向分解（J4 管 z 向 / J5 管横向）待装机日实测，v1 按幅度路由。
+
+    Args:
+        err_mm:    像素误差换算后的毫米误差（|err|，正值）
+        q_current: 当前六轴关节角列表 [6]
+        center:    J4 锚点 °；None → 锚在当前 q4（回合起点）
+
+    Returns:
+        (dq4, q4_target)  dq4=修正增量 °（含符号），q4_target=修正后 J4 目标角。
+        若无需修正返回 (0.0, q_current[3])。
+    """
+    # L4·sin(1°) = 每度对应的末端位移 mm（自动跟随 L4 变化）
+    mm_per_deg = config.L4 * math.sin(math.radians(1.0))
+    # 所需 J4 角度修正量
+    dq4_raw = err_mm / mm_per_deg
+    # 量子化到 WRIST_QUANTUM_DEG 倍数（保号）
+    sign = 1.0 if dq4_raw >= 0 else -1.0
+    dq4_q = sign * config.WRIST_QUANTUM_DEG * int(abs(dq4_raw) / config.WRIST_QUANTUM_DEG + 0.999)
+    if abs(dq4_q) < 1e-6:
+        return 0.0, q_current[3]
+    if center is None:
+        center = q_current[3]
+    q4_new = q_current[3] + dq4_q
+    # slack 钳制：|q4 − center| ≤ J4_SLACK_DEG
+    q4_lo = center - config.J4_SLACK_DEG
+    q4_hi = center + config.J4_SLACK_DEG
+    q4_clamped = max(q4_lo, min(q4_hi, q4_new))
+    dq4 = q4_clamped - q_current[3]
+    if abs(dq4) < 1e-6:
+        return 0.0, q_current[3]
+    return dq4, q_current[3] + dq4

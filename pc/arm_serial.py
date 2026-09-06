@@ -30,6 +30,7 @@ import serial  # pip install pyserial
 
 import config
 from kinematics import from_servo, to_servo, servo_limits, servo_clamp
+from servo_controller import estimate_move_seconds
 
 
 def _checksum(cmd):
@@ -192,7 +193,8 @@ class ArmSerial:
         """ADR-3 P2：发 G 批量目标（六轴关节角），轮询 Q 直到 DONE。
 
         PC 不再逐 20ms 刷点——MCU 自主梯形执行，PC 只发拐点。
-        超时 = 预估时长(最大关节位移/MAX_VEL) × FACTOR + EXTRA。
+        超时 = estimate_move_seconds(from_q, to_q) × DONE_TIMEOUT_FACTOR
+               + DONE_TIMEOUT_EXTRA_S（bite-aware 预估，镜像 servo.c 模型）。
         回显铁律：校验 G 回显的六个 clamp 后目标值。
         返回 (True, "ok") 或 (False, 原因)。
         """
@@ -201,8 +203,9 @@ class ArmSerial:
                q[i] > config.JOINT_MAX[i] + config.LIMIT_EPS:
                 return False, "joint %d out of range %.1f" % (i + 1, q[i])
         prev = list(self.joint_state)
-        dmax = max(abs(q[i] - prev[i]) for i in range(6))
-        timeout_s = (dmax / config.MAX_VEL) * config.DONE_TIMEOUT_FACTOR \
+        # bite-aware 预估（替代旧 dmax/MAX_VEL 线性公式）
+        est_s = estimate_move_seconds(prev, q)
+        timeout_s = est_s * config.DONE_TIMEOUT_FACTOR \
             + config.DONE_TIMEOUT_EXTRA_S
 
         servos = [int(round(q[i] + config.JOINT_OFFSET[i])) for i in range(6)]

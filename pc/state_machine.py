@@ -27,7 +27,7 @@ import time
 
 import config
 import kinematics
-from servo_controller import ServoController
+from servo_controller import ServoController, estimate_move_seconds, compute_wrist_correction
 from trajectory import TrajectoryError
 
 log = logging.getLogger(__name__)
@@ -196,11 +196,16 @@ class StateMachine:
 
     # ---------- 视觉伺服 ----------
     def _servo_align(self, t0, state):
-        """视觉伺服：让目标收敛到画面中心（像素域 PID）。
+        """视觉伺服：让目标收敛到画面中心（wrist-first 分层）。
 
-        误差 = 目标像素位置 - 画面中心；关节增量 = Kp·e（先只调 P）。
+        误差路由（按幅度）：
+          < ALIGN_DEADBAND_MM → 不动（收敛判定不变）
+          ≤ 腕层权限 → J4 单轴修正（量子化 + slack 钳制）
+          超腕层或停滞 → 粗层 J1/J2/J3（最小步距 COARSE_MIN_STEP_DEG）
+        方向级分解（J4 管 z 向 / J5 管横向）待装机日实测，v1 按幅度路由。
+
         丢失保护：连续 LOST_FRAME_THRESHOLD 帧未检出 → 判定目标丢失。
-        跳变检测：误差突然放大（>上帧×RATIO+JUMP_PX）→ 异常帧丢弃（防误检污染）。
+        跳变检测：误差突然放大（>上帧×RATIO+JUMP_PX）→ 异常帧丢弃。
 
         Returns:
             ("OK", (cx, cy, theta_deg)) 对齐完成
@@ -218,6 +223,9 @@ class StateMachine:
         cx0 = cy0 = None               # 伺服目标点（首帧实拍坐标计算，见下）
         lost = 0
         prev_err = None
+        wrist_stall_count = 0          # 腕层停滞计数（连续腕修正误差未下降 → 升粗层）
+        wrist_center = None            # J4 回合锚点（最近粗层解的 J4；None=待锚定）
+        prev_wrist_err = None          # 上次腕层误差（用于停滞判定）
         self.ctrl.reset_ema()          # EMA 状态每次对齐独立，不跨调用
         for _ in range(config.ALIGN_MAX_ITER):
             if self._timeout(t0, state):
@@ -258,23 +266,74 @@ class StateMachine:
                       % (state, prev_err, err))
                 continue
             prev_err = err
+            # --- 收敛判定（不变）---
             if abs(ex) < config.ALIGN_PX_TOL and abs(ey) < config.ALIGN_PX_TOL:
                 return "OK", (cx, cy, theta_deg)
-            # 像素误差 → 关节增量（J1 水平纠偏，J2/J3 垂直纠偏）
-            # 增量方向/符号待实测标定（摄像头安装方向决定），先按正方向
-            dq0, dq12 = self.ctrl.align_delta(ex, ey, config.ALIGN_MAX_STEP)
-            q = self.ctrl.apply_joint_deltas(self.serial.joint_state,
-                                             dq0, dq12)
-            ok, msg = self.ctrl.check_limits(q, state)
-            if not ok:
-                self._to_error(msg)
-                return ("ERR", None)
-            try:
-                # 对齐微调朝木块逼近：禁消隙过冲（过冲会把末端压向目标外）
-                self.traj.move_to(self.serial, q, overshoot=False)
-            except TrajectoryError as e:
-                self._to_error("%s servo move: %s" % (state, e))
-                return ("ERR", None)
+            # --- 像素误差 → 毫米误差（粗略换算，用于 wrist-first 路由）---
+            # PX_TO_MM 未标定预置值（config；装机日标定板实测回填）
+            err_mm = err * config.PX_TO_MM
+            # --- 路由：deadband → 腕层 → 粗层 ---
+            if err_mm < config.ALIGN_DEADBAND_MM:
+                # 误差极小，本轮不动（收敛判定已在上面处理，这里防抖）
+                time.sleep(config.ALIGN_POLL_MS / 1000.0)
+                continue
+            mm_per_deg = config.L4 * math.sin(math.radians(1.0))
+            wrist_budget_mm = config.J4_SLACK_DEG * mm_per_deg
+            if err_mm <= wrist_budget_mm and wrist_stall_count < config.WRIST_STALL_LIMIT:
+                # --- 腕层路径：J4 单轴修正 ---
+                if wrist_center is None:
+                    wrist_center = self.serial.joint_state[3]  # 回合锚：最近粗层解的 J4
+                dq4, q4_target = compute_wrist_correction(err_mm,
+                                                          self.serial.joint_state,
+                                                          wrist_center)
+                if abs(dq4) < 1e-6:
+                    # J4 已在 slack 边界饱和（或量化为 0）→ 记停滞，
+                    # 下轮路由升粗层，避免边界无限循环
+                    wrist_stall_count = config.WRIST_STALL_LIMIT
+                    time.sleep(config.ALIGN_POLL_MS / 1000.0)
+                    continue
+                # 构造目标：只变 J4，其余轴用当前 joint_state
+                q = list(self.serial.joint_state)
+                q[3] = q4_target
+                ok, msg = self.ctrl.check_limits(q, state)
+                if not ok:
+                    self._to_error(msg)
+                    return ("ERR", None)
+                try:
+                    self.traj.move_to(self.serial, q, overshoot=False)
+                except TrajectoryError as e:
+                    self._to_error("%s wrist move: %s" % (state, e))
+                    return ("ERR", None)
+                # 停滞检测：连续腕修正误差未下降 → 升粗层
+                if prev_wrist_err is not None and err_mm >= prev_wrist_err:
+                    wrist_stall_count += 1
+                else:
+                    wrist_stall_count = 0
+                prev_wrist_err = err_mm
+            else:
+                # --- 粗层路径：J1/J2/J3（最小步距纪律）---
+                dq0, dq12 = self.ctrl.align_delta(ex, ey, config.ALIGN_MAX_STEP)
+                # 最小步距：非零 delta < COARSE_MIN_STEP_DEG → 提升到该值（保号）
+                if abs(dq0) > 1e-6 and abs(dq0) < config.COARSE_MIN_STEP_DEG:
+                    dq0 = config.COARSE_MIN_STEP_DEG if dq0 > 0 else -config.COARSE_MIN_STEP_DEG
+                if abs(dq12) > 1e-6 and abs(dq12) < config.COARSE_MIN_STEP_DEG:
+                    dq12 = config.COARSE_MIN_STEP_DEG if dq12 > 0 else -config.COARSE_MIN_STEP_DEG
+                q = self.ctrl.apply_joint_deltas(self.serial.joint_state,
+                                                 dq0, dq12)
+                # J4 由 IK 解重设，腕层预算复位并重锚回合
+                wrist_stall_count = 0
+                prev_wrist_err = None
+                wrist_center = None
+                ok, msg = self.ctrl.check_limits(q, state)
+                if not ok:
+                    self._to_error(msg)
+                    return ("ERR", None)
+                try:
+                    # 对齐微调朝木块逼近：禁消隙过冲（过冲会把末端压向目标外）
+                    self.traj.move_to(self.serial, q, overshoot=False)
+                except TrajectoryError as e:
+                    self._to_error("%s servo move: %s" % (state, e))
+                    return ("ERR", None)
             time.sleep(config.ALIGN_POLL_MS / 1000.0)
         self._to_error("%s: align not converged" % state)
         return ("ERR", None)
@@ -403,6 +462,10 @@ class StateMachine:
                               % (cx, cy, theta_deg))
                         final_ok = True
                         break
+                    # 死区：误差在 deadband 内但未达收敛阈值 → 不修正（防微抖）
+                    if _err * config.PX_TO_MM < config.ALIGN_DEADBAND_MM:
+                        time.sleep(config.ALIGN_POLL_MS / 1000.0)
+                        continue
                     # 小幅限幅修正（近距一步不能过头）
                     dq0, dq12 = self.ctrl.align_delta(ex, ey, config.FINAL_ALIGN_MAX_STEP)
                     q = self.ctrl.apply_joint_deltas(self.serial.joint_state,
