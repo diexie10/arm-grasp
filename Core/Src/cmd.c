@@ -198,8 +198,8 @@ static void Cmd_Execute(const char *line)
         {
           Axis_SetTarget(gi, ClampJoint(gi, gv[gi]), 1U);
         }
-        motion_done     = 0U;
-        move_start_tick = HAL_GetTick();
+        motion_done = 0U;
+        Servo_NoteMotionStart();  /* after all Axis_SetTarget calls */
         CDC_Reply("OK G %u %u %u %u %u %u\r\n",
                   axis[0].target, axis[1].target, axis[2].target,
                   axis[3].target, axis[4].target, axis[5].target);
@@ -239,7 +239,7 @@ static void Cmd_Execute(const char *line)
         motion_done = 0U;
       }
     }
-    if (was_estop == 0U) { move_start_tick = HAL_GetTick(); }
+    if (was_estop == 0U) { Servo_NoteMotionStart(); }
     CDC_SendString("OK H\r\n");
   }
   else if ((line[0] == 'E') || (line[0] == 'e'))

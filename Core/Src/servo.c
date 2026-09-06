@@ -25,8 +25,13 @@
 #define REACH_TOL         0.01f   /* arrival threshold, deg                  */
 #define SETTLE_TICKS         3U   /* consecutive at-target ticks before DONE */
 #define STAGGER_TICKS        3U   /* axis i starts i*3 ticks later = 60 ms   */
-#define MOTION_HARD_CAP_MS 15000U /* force-complete window after G; guarantees
-                                   the idle-timeout suppression cannot last */
+/* Bite-aware hard cap (replaces old fixed MOTION_HARD_CAP_MS 15000).
+ * Estimated worst-case per G command; floor prevents tiny-motion absurdity;
+ * margin covers settling jitter; absolute cap is the final backstop. */
+#define MOTION_HARD_CAP_MAX_MS  30000U  /* absolute ceiling (backstop)        */
+#define HARD_CAP_SAFETY_FACTOR  2U      /* 2x estimate headroom               */
+#define HARD_CAP_MARGIN_MS      2000U   /* fixed settle/jitter allowance      */
+#define HARD_CAP_FLOOR_MS       1000U   /* minimum deadline for trivial moves */
 
 /* Per-axis cruise/crawl caps (deg/tick; x50 = deg/s). One global MAX_VEL=30
  * deg/s made S3 (elbow, loaded with forearm+wrist) hunt visibly: the command
@@ -43,7 +48,8 @@ static const float min_vel[6] = {0.15f, 0.15f, 0.15f, 0.15f, 0.15f, 0.15f}; /* c
  * glide, park STEP_DWELL_TICKS, repeat - each setpoint lets the servo settle
  * dead before the next. Precision >> speed. Adaptive bite width: 15 deg
  * mid-travel, 10 deg approach, 5 deg final (user-tuned).
- * Applies to: S1 base + S3 elbow (both loaded, both hunted). */
+ * Applies to: S1 base + S2 shoulder + S3 elbow (all loaded, all hunted).
+ * S2 added 2026-09-06; assembly-day full-load observation pending. */
 #define STEP_NEAR_DEG      5.0f
 #define STEP_MID_DEG       10.0f
 #define STEP_FAR_DEG       15.0f
@@ -90,15 +96,17 @@ const uint16_t joint_max[6] = {191U, 183U, 167U, 187U, 270U, 270U};
  * on re-calibration both tables MUST be rechecked — do NOT merge. */
 const int8_t servo_trim[6] = {-11, -3, -5, -7, 0, 0};
 
-/* Per-axis step mode: 1 = step-and-dwell (S1 base + S3 elbow), 0 = continuous */
-const uint8_t axis_steps[6] = {1U, 0U, 1U, 0U, 0U, 0U};
+/* Per-axis step mode: 1 = step-and-dwell (S1 base + S2 shoulder + S3 elbow),
+ * 0 = continuous. S2 added 2026-09-06; assembly-day full-load observation pending. */
+const uint8_t axis_steps[6] = {1U, 1U, 1U, 0U, 0U, 0U};
 
 /* Motion state */
 ServoAxis axis[6] = {
   AXIS_IDLE, AXIS_IDLE, AXIS_IDLE, AXIS_IDLE, AXIS_IDLE, AXIS_IDLE,
 };
-uint8_t  motion_done     = 1U;  /* Q query reply state; only G clears */
-uint32_t move_start_tick = 0U;  /* HAL tick when G was accepted       */
+uint8_t  motion_done       = 1U;  /* Q query reply state; only G clears */
+uint32_t move_start_tick   = 0U;  /* HAL tick when G was accepted       */
+uint32_t motion_deadline_ms = 0U; /* bite-aware deadline (ms from start) */
 static uint32_t ramp_tick       = 0U;  /* RampStep pacing                    */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -258,6 +266,90 @@ void Servo_DisableAll(void)
 }
 
 /**
+  * @brief  Estimate worst-case motion duration (ms) for the current G command.
+  *         Simulates the bite sequence for step axes, trapezoidal profile for
+  *         continuous axes, then returns the per-axis maximum.
+  * @note   Must be called AFTER all six Axis_SetTarget calls (estimation
+  *         depends on target being set). Unit: tick = 20 ms (RAMP_TICK_MS).
+  */
+uint32_t Servo_EstimateMotionMs(void)
+{
+  uint8_t i;
+  float max_ticks = 0.0f;
+
+  for (i = 0U; i < 6U; i++)
+  {
+    float abs_dist = fabsf((float)axis[i].target - axis[i].current);
+    float a = ACC_PER_TICK;
+    float vmax = max_vel[i];
+    float t = 0.0f;
+
+    if (axis_steps[i] != 0U)
+    {
+      /* Step axis: simulate bite sequence from abs_dist */
+      float remaining = abs_dist;
+      uint32_t bites = 0U;
+
+      while ((remaining > REACH_TOL) && (bites < 1000U))
+      {
+        float bite = StepBiteSize(remaining);
+        float b = (remaining > bite) ? bite : remaining;
+        float v_peak = sqrtf(a * b);
+        float t_bite;
+
+        if (v_peak <= vmax)
+        {
+          t_bite = 2.0f * sqrtf(b / a);
+        }
+        else
+        {
+          t_bite = b / vmax + vmax / a;
+        }
+
+        t += t_bite;
+        remaining -= b;
+        bites++;
+        if (bites > 1U) { t += (float)(STEP_DWELL_TICKS); }
+      }
+
+      t += (float)SETTLE_TICKS + (float)i * (float)STAGGER_TICKS;
+    }
+    else
+    {
+      /* Continuous axis: trapezoidal approximation */
+      if (abs_dist > REACH_TOL)
+      {
+        t = abs_dist / vmax + vmax / a;
+      }
+      t += (float)SETTLE_TICKS;
+    }
+
+    if (t > max_ticks) { max_ticks = t; }
+  }
+
+  return (uint32_t)(max_ticks * (float)RAMP_TICK_MS + 0.5f);
+}
+
+/**
+  * @brief  Record motion start and compute bite-aware deadline.
+  *         Called after all Axis_SetTarget calls in the G command handler.
+  *         Deadline = min(est * SAFETY_FACTOR + MARGIN, MAX) with FLOOR floor.
+  */
+void Servo_NoteMotionStart(void)
+{
+  uint32_t est = Servo_EstimateMotionMs();
+  uint32_t deadline;
+
+  move_start_tick = HAL_GetTick();
+
+  if (est < HARD_CAP_FLOOR_MS) { est = HARD_CAP_FLOOR_MS; }
+  deadline = est * HARD_CAP_SAFETY_FACTOR + HARD_CAP_MARGIN_MS;
+  if (deadline > MOTION_HARD_CAP_MAX_MS) { deadline = MOTION_HARD_CAP_MAX_MS; }
+
+  motion_deadline_ms = move_start_tick + deadline;
+}
+
+/**
   * @brief  Trapezoidal motion executor (ADR-3 §3). Called from main loop.
   *         Per axis: accelerate to MAX_VEL, cruise, decelerate along
   *         v^2/(2a) distance, settle SETTLE_TICKS at target.
@@ -344,10 +436,13 @@ void Servo_RampStep(void)
 
   motion_done = all_settled;
 
-  /* Hard cap: if motion somehow never completes (stale target unreachable),
-   * force-complete so idle-timeout protection resumes. */
-  if ((motion_done == 0U) &&
-      ((HAL_GetTick() - move_start_tick) > MOTION_HARD_CAP_MS))
+  /* Hard cap: bite-aware deadline replaces the old fixed MOTION_HARD_CAP_MS.
+   * For G: motion_deadline_ms is pre-computed by Servo_NoteMotionStart.
+   * For H (estop recovery): motion_done is set to 0 only in the non-estop
+   * path, so motion_deadline_ms stays 0 from the estop path — the check
+   * below is skipped when motion_done == 1 (timeout protection resumes). */
+  if ((motion_done == 0U) && (motion_deadline_ms != 0U) &&
+      (HAL_GetTick() > motion_deadline_ms))
   {
     for (i = 0U; i < 6U; i++)
     {
