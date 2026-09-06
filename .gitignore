@@ -14,3 +14,8 @@ MDK-ARM/arm-grasp/
 # OS junk
 Thumbs.db
 desktop.ini
+
+# 可再生的训练数据/基础权重/工具缓存（不入库）
+pc/yolo_multiscale/
+pc/weights/
+.embai/
