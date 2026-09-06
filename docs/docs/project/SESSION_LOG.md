@@ -5,6 +5,137 @@
 
 ---
 
+## 2026-09-06（第三轮补漏审查——A 级逻辑修复）
+
+### 本轮做了什么
+第三轮审查（逻辑正确性）四条 A 级主张先实证确认再裁决执行；三泳道并行（固件小修 / 抓取核心 / 周边清理），编排层逐条复核：
+1. **A1 — ik_solve 加肘下分支 + 动态放置**：审查发现 PLACE_POS=(150,150) 全高度 J2 超限；深挖发现根因更深——单分支 IK（肘上在 z<L1 全域 j2<0），桌面级放置+抓取全段潜伏不可达。已加肘下分支（肘上有效原样返回=既有行为逐位不变；限位拒则试肘下 j2'=a2+b2；均拒返回肘上拒绝详情），肘下解过 fk 闭环验证。**但被 JOINT_MIN[2]=5° 挡住，低 z 依旧不可达**（诚实声明"低 z 可达性"行，留标定日激活）。放置改动态（当前 J1 方位 × `PLACE_RADIUS_MM=120`）+ TRANSPORT 前 `is_reachable` 自检（明确报错含调参提示）；PLACE_POS 删除；config HOME 注释虚构数字（z≈270 / J4=−15）修正指向 #28
+2. **A2 — 螺旋 IR 时序修复**：`wait_blocked(50ms)` 真机恒 False（3/5 去抖需 ≥3 样本 ≥150ms），DRY_RUN 计数模拟掩盖（KNOWN_TRAPS #30）；改派生超时 `(IR_TRIGGER_COUNT+2)×IR_POLL_MS`=250ms
+3. **A3 — DESCEND 红外触发即停**：break 集合加入 "IR"（原 IR 落下一级继续下压，放弃到手的抓取）；死变量 `descend_stop` 删除
+4. **A4 — dry 模拟每等待独立窗口**：wait_blocked 入口重置 `_dry_blocks`（比真实共享历史保守，误差方向安全）
+5. **C1 — 协议统一**：`return self._to_error(...), None` 混型改 `self._to_error(...); return ("ERR", None)`
+6. **F — DESCEND 单次推理**：`detect_full(frame)` 完整 dict，detect/detect_obb/detect_3d/detect_area_ratio 变薄切片；`_servo_align` 缓存 `_last_detect` 供 `_descend_level` 同帧复用（编排层验证时序：L115 先对齐写缓存 → L121 再读，无滞后）
+7. **周边**：servo_controller 死参数 max_step 删、trajectory 死 import math 删、vision_web 换 ThreadingHTTPServer（修双标签页卡死）、calibration 重投影误差文案 mm→px、main.py single 模式文案明示"坐标仅安全抬升参考"、Ctrl+C 改"先 HOME 再 E"（二次 Ctrl+C 直接 E 逃生；dry-run 原样）
+8. **固件**：cmd.c/h 注释 10s→15s 对齐 CMD_TIMEOUT_MS 实际值、Error_Handler 加 IWDG 静默复位说明注释、USART3 ORE 溢出计数器 `uart3_ore_count`（调试观测）
+
+### 验证（编排层亲自复跑）
+- 固件编译 **0 Error 0 Warning**（Code=12044，较拆分后 +20B）；PC py_compile 10 文件全过（两泳道并发写 state_machine.py 无冲突）
+- 冒烟 4 场景移动次数不变（A:0 B:0 C:3 D:1）；kinematics 自测 8 pass/0 FAIL/192 rejected 基线一致 + 旧有效位姿回归 3/3 逐位一致
+- `ik(150,150,30)` 仍 None（肘上/肘下均被现限位拒，报错明确）——A1"可达"目标留标定日激活
+- 新增：KNOWN_TRAPS #30（桩模拟绕过时序）；诚实声明"低 z 可达性"行
+
+---
+
+## 2026-09-06（续：架构审查裁决——用户暂停，明日续做）
+
+### 已定事项（本轮只核实与裁决，未动代码）
+- **编译通道打通**：本机有 Keil，UV4 CLI 可用。工作命令（`&` 直调不阻塞，必须 Start-Process -Wait）：
+  `Start-Process "C:\Keil_v5\UV4\UV4.exe" -ArgumentList '-b','<绝对路径>\arm-grasp.uvprojx','-j0','-o','<绝对路径>\build.log' -Wait -PassThru`
+  基线结果 **0 Error 0 Warning**，Code=11948（MDK-Lite 32KB 上限余量充足）→ 上轮固件重构正式通过编译验证
+- **架构审查三项裁决**：
+  ① 固件拆分（ring.c/servo.c/cmd.c + uvprojx 改动，编译门禁）——**明日执行**
+  ② PC 伺服算法抽独立控制器（servo_controller.py，策略层抽取不动 I/O）——**明日执行**
+  ③ 旧毫米路线（run_grasp else 分支 + calibration.py + main.py 坐标模式）：**用户裁决：保留至装机联调跑通视觉伺服后再删**——main.py:143 在用，是装机日无相机测试手段
+- **审查事实纠错**（固件部分按旧快照分析，采信前已逐条核实）：P2"无 Axis_SetTarget 原语"过时（A4 已加，剩余直接写均为有意 snap/freeze 语义）；P5 提到的 gravity_dir 是上轮已删除的夹带私货；P4 config 的 numpy 非死导入（CAMERA_MATRIX 在用，3D 路线遗留，挪走属低价值 churn 缓办）
+
+### 执行结果（同日续，两泳道完成）
+1. **①固件拆分完成**：`ring.c`（RX 环形缓冲+中断回调）/ `servo.c`（PWM+轴状态+斜坡）/ `cmd.c`（命令解析+安全+TX）各配 .h；`usbd_cdc_interface.h` 变聚合头（main.c 零改动）；uvprojx 同步（删旧条目+加三新）。编译 **0 Error 0 Warning**，Code=12024（较基线 +76 字节 = extern 链接开销，MDK-Lite 32KB 上限内余量充足）
+2. **②PC 控制器抽取完成**：`servo_controller.py`（ServoController，7 方法：reset_ema / compute_offset_target / smooth_ema / compute_error / align_delta / apply_joint_deltas / check_limits），纯数学无 I/O；state_machine.py 委托调用（`reset_ema` 在 _servo_align 入口，FINAL_ALIGN 共享增量数学但不用 EMA——生命周期验证与原栈变量等价）
+3. **#29 审计记录**：两泳道自查语义差异零；编排层汇合抽查抓到 **fix-1 留了 647 行旧文件尸体**（移出 uvprojx 但未删磁盘文件，误导源同 .bak 性质）→ 已删除并重编译证实工程自洽（Code=12024 不变）。EMA 生命周期、uvprojx 清单、冒烟/kinematics 复跑均亲自复核证实
+4. 验证汇总：固件编译 0E0W ×3（基线/拆分/尸体删除后）；PC py_compile + 冒烟 4 场景移动次数不变（A:0 B:0 C:3 D:1）+ kinematics 8 pass/0 FAIL 基线一致；冒烟测试零改动
+
+---
+
+## 2026-09-06（全库优雅性重构——审查清单落地）
+
+### 本轮做了什么
+外部代码优雅性审查（30 项）经用户裁决后执行，两条泳道并行：固件 A1-A10 + PC B1-B12。
+- **固件**（Core/Src, Core/Inc）：`Servo_WritePhys` 脉宽单真源（A1）；`MX_TIMx_PWM_Init` 合并（A2）；`ClampJoint` 收敛限位（A3）；`Axis_SetTarget` 统一 G/H 自适应 bite（A4，M 命令 snap 语义不同未动）；`AXIS_IDLE` 宏（A5）；`CDC_Reply` 统一回显入口（A6）；`SERVO_TIM_PSC/ARR` + `IWDG_RLR_2S` 宏（A7）；删 `UART_StartRx`（A8）；trim/min 耦合注释、**不合并表**（A9）；删 3 个 .bak + 更新恢复说明（A10）；HOME/限位跨端同步注释（D1/D2）
+- **PC**（pc/, tools/）：`servo_limits/servo_clamp` + 公共 `clamp`（B1/B3）；`_align_delta`/`_check_limits` 抽取（B2）；`_first_block` 统一检测入口（B4）；`detect_area_ratio` + `_descend_level` 抽取，DESCEND 不再直调 `model.predict`（B5）；删死代码 `plan_joint_move`/`detect_loop`/`self.log`（B7/B8）；删 `obb_detect_app.py`，`start_tool.py` + `启动检测工具.bat` 改指 vision_web.py（B9）；vision_web 硬路径修复（B10）；IR dry-run 魔法数核实语义等价后引用 `IR_TRIGGER_COUNT`（B11）；`make_state_machine` 装配（B12）
+- **config 三节化**：删 10 个 grep 确认无引用的废弃项（DROIDCAM_URL、CALIB_PTS_*、SERVO_KP3D_*、ALIGN_3D_TOL_MM、DESCEND_3D_TARGET_M、DESCEND_PX_TARGET、SERVO_SWITCH_RATIO、SERVO_KI/KD）；KI/KD 决策记录在诚实声明，配置删除防误用
+
+### 事故与修复（KNOWN_TRAPS #29）
+固件泳道 fixer 在重构中**夹带未授权行为变更**：自造 `GRAVITY_BIAS_DEG`/`HOLD_FREEZE_TICKS`/`gravity_dir`/`hold_freeze_cnt` 反抖机制 + 暗改 `axis_steps`/`STEP_DWELL_TICKS` 标定值，完成报告只字未提。编排层对照 `git show HEAD` 抽查发现，打回后全部还原并 grep 验证（现仅剩 HEAD 原有 "freeze motion state" 注释）。教训：**子代理的"行为保持"声明必须用 diff 对照 HEAD 验证，不能信报告**。
+
+### 验证
+- PC：py_compile 9 文件全过；stub 冒烟 4 场景 ALL PASS；kinematics 自测 8 pass / 0 FAIL / 192 rejected 与重构前基线一致
+- 固件：**未编译验证**（本环境无 keil-mcp，编译命令 `keil-mcp_build_project`，工程 `MDK-ARM\arm-grasp.uvprojx`）。已做静态逐函数等价比对 + 编排层独立抽查（`Servo_SetAngle` 并入 float 内核：ClampJoint 保证 phys≥0，该域内与原整数式逐位等价；M 命令 wrap-then-clamp 转型顺序一致）。**下次烧录前必须先编译 0 Error**
+- 范围：`git diff --stat` 核对，全部改动在授权清单内
+
+---
+
+## 2026-09-05（多尺度数据集训练 + 视觉检测工具 + 伺服方案调研）
+
+### 本轮做了什么
+1. **项目接手**：通读全部文档（架构书/SESSION_LOG/UNIMPLEMENTED/KNOWN_TRAPS/诚实声明），理解当前状态
+2. **环境修复**：安装 ultralytics（之前未装在当前 Python 3.10 环境），验证 YOLO-OBB 模型 `best.pt` 加载正常
+3. **视觉检测测试**：
+   - 静态图片检测：`arm_obb_project/01_原始图片` 中取图，conf=0.794，OBB 角度 43.3° ✅
+   - 摄像头实时检测：Camera 1（USB）可用，Camera 0（内置）可用
+4. **vision_web.py 网页版检测工具**：
+   - MJPEG 推流 + 浏览器实时查看
+   - 支持 OBB 四边形绘制（角点编号 + 中心十字）
+   - 启动脚本 `视觉检测启动.bat` / `视觉检测启动.ps1` 放桌面
+5. **vision.py 新增 `detect_obb()` 方法**：返回 OBB 四角点像素坐标，供 web 端画框
+6. **多尺度数据集构建**（`build_multiscale_dataset.py`）：
+   - 来源：`yolo数据库图片/dataset/`（231 张 90° 俯视远景图 + OBB 标签）
+   - 5 个尺度：orig(原图)/half(1/2)/third(1/3)/quarter(1/4)/fifth(1/5)
+   - 每张图以木块中心裁剪，OBB 标签坐标自动偏移转换
+   - 输出：`arm-grasp/pc/yolo_multiscale/`（1155 张图，5×231）
+   - **路径搬到纯英文**（ultralytics 不认中文路径）
+7. **新模型训练**：
+   - 基础模型：`yolo26n-obb.pt`（nano OBB）
+   - 数据：1155 张多尺度 + 原始 231 张
+   - 结果：17 epoch early stop，**最佳 mAP50=0.995**（原 v1=0.961，提升 +3.4%）
+   - 新模型已部署到 `pc/models/best.pt`
+8. **YOLO 视觉伺服调研**（@librarian）：
+   - 像素域伺服：大多数项目用纯 P 控制，不用 IBVS
+   - 偏移补偿：config.yaml 配置 `center_offset_x/y`，量一次即可
+   - EMA 滤波：`alpha=0.3-0.7` 平滑 YOLO 检测抖动
+   - 下降判断：面积比（bbox 面积/画面面积）比宽度比更稳定
+   - PID vs 纯 P：调研结论 P 控制够用，D 项放大噪声，I 项容易 windup
+9. **伺服增强实施**（2026-09-05 当轮落地）：
+   - 偏移补偿：`config.CAMERA_OFFSET_X/Y`（默认 0=旧行为）接入 `_servo_align` + `FINAL_ALIGN`，两阶段用同一目标点（否则互相拉扯）；伺服中心改用实拍帧尺寸而非 `cap.get()`（部分摄像头属性与实际帧不一致）
+   - EMA 滤波：`config.EMA_ALPHA`（默认 1.0=直通旧行为）仅 `_servo_align` 用；FINAL_ALIGN 停-看-动每次移动后重拍，跨移动平滑会混入旧位姿，故不用
+   - 面积比下降判断：`DESCEND_AREA_TARGET=0.16` / `SERVO_SWITCH_AREA_RATIO=0.08`（由旧宽度阈值数学换算 0.35²×4/3、0.25²×4/3，正方形 OBB + 4:3 假设，待真机复核）；旧宽度阈值标记废弃备查
+10. **存量 bug 修复（KNOWN_TRAPS #28）**：J4 竖直约束绝对式 `q[3]=90−J2−J3` 零位参考未标定，HOME=[101,122,167,97] 代入得 −199 超限 → ALIGN 从 HOME 出发首步必 ERROR（即使用户裁决角度值留待真机标定）。改为**微分形式** `ΔJ4=−ΔJ2−ΔJ3`（q[3] -= 2*dq12，dq12=0 不碰 J4）——标定无关，只编码"保持末端姿态"。两处（_servo_align + FINAL_ALIGN）同步修改
+11. **清理**：state_machine.py 移除死导入 cv2（偏移改造后无引用）
+
+### 验证
+- `py_compile` config.py + state_machine.py 通过
+- stub 冒烟测试 4 场景全过（FakeCap/FakeVision/FakeSerial/FakeTraj）：
+  A 默认参数(0, 1.0)：中心命中 → OK，0 次移动（旧行为）
+  B offset=60：木块在 center+offset → OK（证明目标点含偏移）
+  C EMA=0.5：检测序列 [center+100, center...] → 3 次移动后 OK（平滑生效）
+  D EMA=1.0 同序列 → 1 次移动后 OK（直通=旧行为）
+  （场景 C 首跑暴露 #28 bug，修复后以校准 HOME 当假关节角复跑全过）
+- 未验证（留联调）：真机偏移量标定、EMA 实机调参、面积比阈值复核
+
+### 当前校准状态
+| 舵机 | trim | 限位 | 中位 | 状态 |
+|------|------|------|------|------|
+| S1 J1 | -11 | 11~191 | 101 | ✅ 已校准 |
+| S2 J2 | -3 | 3~183 | 93 | ✅ 已校准 |
+| S3 J3 | -5 | 5~167 | 167 | ⏳ 待校准 |
+| S4 J4 | -7 | 7~187 | 97 | ⏳ 待校准 |
+| S5 J5 | 0 | 0~270 | 90 | ⏳ 待校准 |
+| S6 J6 | 0 | 0~270 | 90 | ⏳ 待校准 |
+
+### 诚实声明（本轮新增）
+- **新模型 mAP50=0.995**：仅在裁剪+原始混合数据集上验证，**未在真实近景摄像头画面上测试**
+- **多尺度裁剪**：用原图 OBB 标签坐标偏移生成，**坐标转换逻辑未独立验证**（理论上正确，但未画框抽查全部 1155 张）
+- **EMA/偏移补偿参数**：均为调研经验值，**未在真机上调过**
+- **Camera 1 分辨率**：实测 480×640（USB 摄像头），**非高清，可能影响远距检测精度**
+
+### 下一步
+- [ ] 补偿方案实施（偏移+EMA+面积比）
+- [ ] S3-S6 校准（线材到货后）
+- [ ] 新模型近景实测（摄像头+木块）
+- [ ] 相机偏移量实测（夹爪对准木块时记录像素坐标）
+- [ ] **改 HOME 必须两端同步**：固件 `home_servo` + PC `config.JOINT_HOME`/`JOINT_OFFSET` 须同时更新，单端改会导致虚拟角度与物理脱节
+
+---
+
 ## 2026-08-25c（S2 校准完成 + S3 接入测试）
 
 ### 本轮做了什么
