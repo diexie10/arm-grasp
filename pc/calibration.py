@@ -27,7 +27,7 @@ class Calibration:
         return self._H is not None
 
     def calibrate(self, px_pts, mm_pts):
-        """由 4 点像素/毫米对应求单应。返回 (True, 重投影误差mm)。"""
+        """由 4 点像素/毫米对应求单应。返回 (True, 重投影误差px)。"""
         assert len(px_pts) == len(mm_pts) == 4
         px = np.array(px_pts, dtype=np.float32)
         mm = np.array(mm_pts, dtype=np.float32)
@@ -36,8 +36,8 @@ class Calibration:
             return False, float("inf")
         self._H_inv = np.linalg.inv(self._H)
 
-        # 重投影误差（单位：像素 px —— H_inv 把 mm 点映回像素域与原始像素比较，
-        # 不是 mm！阈值 5.0 即 5px）
+        # 重投影误差（像素域：H_inv 把 mm 点映回像素域与原始像素比较），
+        # 不是毫米域！阈值 5.0 即 5px（毫米域待真机标定后实现）
         px_back = cv2.perspectiveTransform(
             mm.reshape(-1, 1, 2), self._H_inv).reshape(-1, 2)
         err = float(np.mean(np.linalg.norm(px_back - px, axis=1)))
@@ -128,9 +128,9 @@ class Calibration:
         cv2.destroyWindow(_WINDOW)
         ok, err = self.calibrate(clicks, mm_pairs)
         if not ok:
-            print("!! 标定重投影误差 %.1f mm > 5mm，请重标（检查点序/共线）" % err)
+            print("!! 标定重投影误差 %.1f px > 5px，请重标（检查点序/共线）" % err)
             return None
-        print("标定完成，重投影误差 %.2f mm" % err)
+        print("标定完成，重投影误差 %.2f px（像素域，毫米域待真机标定后实现）" % err)
         return self
 
 

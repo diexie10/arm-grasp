@@ -25,10 +25,9 @@ import logging
 import math
 import time
 
-import cv2
-
 import config
 import kinematics
+from servo_controller import ServoController
 from trajectory import TrajectoryError
 
 log = logging.getLogger(__name__)
@@ -41,15 +40,14 @@ class StateMachine:
         self.ir = ir
         self.vision = vision          # 视觉伺服用（SEARCH/ALIGN 需要）
         self.cap = cap                # 摄像头（SEARCH/ALIGN 需要）
+        self.ctrl = ServoController()  # 视觉伺服策略层（纯数学，无 I/O）
         self.state = "IDLE"
-        self.log = []
         self._target = None            # 当前抓取目标 (x, y)，ERROR 抬升用（P1-1）
         self._theta = None             # 当前目标角度（J5 对齐用）
 
     # ---------- 内部 ----------
     def _set_state(self, s):
         self.state = s
-        self.log.append((time.monotonic(), s))
         print("[SM] -> %s" % s)
 
     def _timeout(self, start, state):
@@ -98,6 +96,59 @@ class StateMachine:
         return all(abs(self.serial.joint_state[i] - config.JOINT_HOME[i]) <= tol
                    for i in range(6))
 
+    def _descend_level(self, t0):
+        """DESCEND 单级：对齐 → 面积比检查 → 下降一档 → 红外判定。
+
+        面积比计算公式和阈值引用（DESCEND_AREA_TARGET/SERVO_SWITCH_AREA_RATIO）一字不变。
+
+        Returns:
+            "OK"     — 成功下降一档，调用方继续下一级
+            "TARGET" — 面积比 ≥ DESCEND_AREA_TARGET，够近，停止下降
+            "SWITCH" — 面积比 ≥ SERVO_SWITCH_AREA_RATIO，切 FINAL_ALIGN
+            "IR"     — 红外触发（当前位置即抓取位）
+            "LOST"   — 目标丢失（调用方回 SEARCH 重扫）
+            "ERR"    — 失败（已转 ERROR）
+        """
+        if self._timeout(t0, "DESCEND"):
+            return "ERR"  # caller prints timeout
+        # 每级先对齐再降
+        res = self._servo_align(t0, "DESCEND")
+        if res[0] == "LOST":
+            return "LOST"
+        if res[0] != "OK":
+            return "ERR"
+        # 复用 _servo_align 缓存的 detect_full 结果（单次推理，无二次 detect）
+        full = self._last_detect
+        if full is not None:
+            ratio = full['area_ratio']
+            if ratio >= config.DESCEND_AREA_TARGET:
+                print("[SM] DESCEND: 面积占比 %.3f 够近，"
+                      "停止下降" % ratio)
+                return "TARGET"
+            if ratio >= config.SERVO_SWITCH_AREA_RATIO:
+                print("[SM] DESCEND: 面积占比 %.3f 达切换阈值"
+                      "（>%.3f），切 FINAL_ALIGN" % (
+                          ratio, config.SERVO_SWITCH_AREA_RATIO))
+                return "SWITCH"
+        # 下降一档：FK 当前 x,y → IK 解降 z（水平不漂移，抬升必可达）
+        x_now, y_now, z_now = kinematics.fk(self.serial.joint_state)
+        q, reason = kinematics.ik_solve(
+            x_now, y_now, z_now - config.DESCEND_STEP,
+            config.GRIP_OPEN)
+        if q is None:
+            self._to_error("DESCEND: IK failed: %s" % reason)
+            return "ERR"
+        try:
+            # 朝桌面/木块下降：禁消隙过冲（过冲点在目标下方，会撞物）
+            self.traj.move_to(self.serial, q, overshoot=False)
+        except TrajectoryError as e:
+            self._to_error("DESCEND move: %s" % e)
+            return "ERR"
+        # 红外触发 = 已接触目标，提前结束下降
+        if self.ir.wait_blocked(300):
+            return "IR"
+        return "OK"
+
     def _spiral_search(self, t0):
         """DESCEND 红外未触发时的微搜索：当前高度做阿基米德螺线扫描。
 
@@ -133,7 +184,9 @@ class StateMachine:
             except TrajectoryError:
                 continue                     # 单点失败不放弃整轮螺旋
             time.sleep(config.SPIRAL_SETTLE_MS / 1000.0)
-            blocked = self.ir.wait_blocked(config.IR_POLL_MS)
+            # 去抖窗口最少样本数 × 轮询间隔（短于它必超时）
+            ir_timeout_ms = (config.IR_TRIGGER_COUNT + 2) * config.IR_POLL_MS
+            blocked = self.ir.wait_blocked(ir_timeout_ms)
             print("[SM] SPIRAL %d/%d: (%.0f, %.0f) IR=%s"
                   % (k, config.SPIRAL_POINTS, xs, ys, blocked))
             if blocked:
@@ -153,20 +206,32 @@ class StateMachine:
             ("OK", (cx, cy, theta_deg)) 对齐完成
             ("LOST", None) 目标丢失（调用方回 SEARCH 重扫）
             ("ERR", None) 失败（已转 ERROR）
+
+        Side effect:
+            self._last_detect — 最后一次 detect_full 结果 dict（供 DESCEND 复用，
+            消除同帧二次推理）。LOST/ERR 时为 None。
         """
+        self._last_detect = None
         if self.vision is None or self.cap is None:
-            return self._to_error("%s: vision/cap not provided" % state), None
-        frame_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
-        frame_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 720
-        cx0, cy0 = frame_w / 2.0, frame_h / 2.0
+            self._to_error("%s: vision/cap not provided" % state)
+            return ("ERR", None)
+        cx0 = cy0 = None               # 伺服目标点（首帧实拍坐标计算，见下）
         lost = 0
         prev_err = None
+        self.ctrl.reset_ema()          # EMA 状态每次对齐独立，不跨调用
         for _ in range(config.ALIGN_MAX_ITER):
             if self._timeout(t0, state):
-                return self._to_error("%s timeout" % state), None
+                self._to_error("%s timeout" % state)
+                return ("ERR", None)
             ret, frame = self.cap.read()
             if not ret:
                 continue
+            if cx0 is None:
+                # 伺服目标 = 画面中心 + 相机-夹爪偏移（config.CAMERA_OFFSET_X/Y）。
+                # 用实拍帧尺寸而非 cap.get()（部分摄像头属性与实际帧不一致）；
+                # 偏移默认 0 = 目标即画面中心（旧行为）。
+                cx0, cy0 = self.ctrl.compute_offset_target(
+                    frame.shape[0], frame.shape[1])
             hit = self.vision.detect(frame)
             if hit is None:
                 lost += 1
@@ -178,8 +243,13 @@ class StateMachine:
                 continue
             lost = 0
             cx, cy, theta_deg, conf = hit
-            ex, ey = cx - cx0, cy - cy0
-            err = (ex * ex + ey * ey) ** 0.5
+            # 缓存 detect_full 结果（DESCEND 复用，消除同帧二次推理）
+            full = self.vision.detect_full(frame)
+            if full is not None:
+                self._last_detect = full
+            # EMA 平滑检测坐标（EMA_ALPHA=1.0 直通 = 旧行为；0.3-0.7 联调再降）
+            cx, cy = self.ctrl.smooth_ema(cx, cy)
+            ex, ey, err = self.ctrl.compute_error(cx, cy, cx0, cy0)
             # 跳变检测：误差突然放大 = 误检/检测跳变，丢弃本帧不动作
             if prev_err is not None and \
                     err > prev_err * config.ALIGN_JUMP_RATIO \
@@ -192,29 +262,22 @@ class StateMachine:
                 return "OK", (cx, cy, theta_deg)
             # 像素误差 → 关节增量（J1 水平纠偏，J2/J3 垂直纠偏）
             # 增量方向/符号待实测标定（摄像头安装方向决定），先按正方向
-            # 限幅：大误差时一步不能超 ALIGN_MAX_STEP（防超限/过冲）
-            q = list(self.serial.joint_state)
-            dq0 = max(-config.ALIGN_MAX_STEP,
-                      min(config.ALIGN_MAX_STEP, config.SERVO_KP * ex))
-            dq12 = max(-config.ALIGN_MAX_STEP,
-                       min(config.ALIGN_MAX_STEP, config.SERVO_KP * ey * 0.5))
-            q[0] += dq0
-            q[1] += dq12
-            q[2] += dq12
-            q[3] = 90.0 - q[1] - q[2]          # 保持末端竖直（J4 = 90 - J2 - J3）
-            # 限位保护：伺服增量不得推出关节限位（超限 = 目标不可达，转 ERROR）
-            for i in range(6):
-                if q[i] < config.JOINT_MIN[i] or q[i] > config.JOINT_MAX[i]:
-                    return self._to_error(
-                        "%s: servo target joint %d out of range %.1f" % (
-                            state, i + 1, q[i])), None
+            dq0, dq12 = self.ctrl.align_delta(ex, ey, config.ALIGN_MAX_STEP)
+            q = self.ctrl.apply_joint_deltas(self.serial.joint_state,
+                                             dq0, dq12)
+            ok, msg = self.ctrl.check_limits(q, state)
+            if not ok:
+                self._to_error(msg)
+                return ("ERR", None)
             try:
                 # 对齐微调朝木块逼近：禁消隙过冲（过冲会把末端压向目标外）
                 self.traj.move_to(self.serial, q, overshoot=False)
             except TrajectoryError as e:
-                return self._to_error("%s servo move: %s" % (state, e))
+                self._to_error("%s servo move: %s" % (state, e))
+                return ("ERR", None)
             time.sleep(config.ALIGN_POLL_MS / 1000.0)
-        return self._to_error("%s: align not converged" % state), None
+        self._to_error("%s: align not converged" % state)
+        return ("ERR", None)
 
     # ---------- 主流程 ----------
     def run_grasp(self, x=None, y=None):
@@ -286,60 +349,22 @@ class StateMachine:
                       % (cx, cy, theta_deg))
 
                 # 3. DESCEND：逐级下降 + 每级对齐（防目标跑出画面）
-                #    远距连续伺服 → 木块占比达 SERVO_SWITCH_RATIO → 切 FINAL_ALIGN
+                #    远距连续伺服 → 面积比达 SERVO_SWITCH_AREA_RATIO → 切 FINAL_ALIGN
                 self._set_state("DESCEND")
                 t0 = time.monotonic()
                 descend_ok = True
                 for level in range(config.DESCEND_LEVELS):
-                    if self._timeout(t0, "DESCEND"):
-                        return self._to_error("DESCEND timeout")
-                    # 每级先对齐再降
-                    res = self._servo_align(t0, "DESCEND")
-                    if res[0] == "LOST":
+                    result = self._descend_level(t0)
+                    if result == "ERR":
+                        return False
+                    if result == "LOST":
                         print("[SM] DESCEND 目标丢失，回 SEARCH 重扫（%d/%d）"
                               % (attempt + 1, config.SEARCH_RETRY_MAX))
                         descend_ok = False
                         break
-                    if res[0] != "OK":
-                        return False
-                    cx, cy, theta_deg = res[1]
-                    # 算木块像素占比，达到切换阈值 → 退出下降，进 FINAL_ALIGN
-                    ret, frame = self.cap.read()
-                    if ret:
-                        hit = self.vision.detect(frame)
-                        if hit is not None:
-                            results = self.vision.model.predict(
-                                frame, conf=self.vision.conf, verbose=False)
-                            if results and results[0].obb is not None \
-                                    and len(results[0].obb) > 0:
-                                _, _, w, h, _ = results[0].obb.xywhr[0].tolist()
-                                ratio = max(w, h) / frame.shape[1]
-                                if ratio >= config.DESCEND_PX_TARGET:
-                                    print("[SM] DESCEND: 木块占比 %.2f 够近，"
-                                          "停止下降" % ratio)
-                                    break
-                                if ratio >= config.SERVO_SWITCH_RATIO:
-                                    print("[SM] DESCEND: 占比 %.2f 达切换阈值"
-                                          "（>%.2f），切 FINAL_ALIGN" % (
-                                              ratio, config.SERVO_SWITCH_RATIO))
-                                    break
-                    # 下降一档：FK 当前 x,y → IK 解降 z（水平不漂移，抬升必可达）
-                    x_now, y_now, z_now = kinematics.fk(self.serial.joint_state)
-                    q, reason = kinematics.ik_solve(
-                        x_now, y_now, z_now - config.DESCEND_STEP,
-                        config.GRIP_OPEN)
-                    if q is None:
-                        return self._to_error("DESCEND: IK failed: %s" % reason)
-                    try:
-                        # 朝桌面/木块下降：禁消隙过冲（过冲点在目标下方，会撞物）
-                        self.traj.move_to(self.serial, q, overshoot=False)
-                    except TrajectoryError as e:
-                        return self._to_error("DESCEND move: %s" % e)
-                    # 红外触发 = 已接触目标，提前结束下降
-                    if self.ir.wait_blocked(300):
+                    if result in ("IR", "TARGET", "SWITCH"):
                         break
-                    if descend_ok is False:
-                        break
+                    # "OK" → continue to next level
                 else:
                     # 全部下降档未触发红外 → 螺旋微搜索（当前高度，补偿
                     # 残余对准误差）；扫到则继续 FINAL_ALIGN，否则报错
@@ -367,8 +392,11 @@ class StateMachine:
                         time.sleep(config.ALIGN_POLL_MS / 1000.0)
                         continue
                     cx, cy, theta_deg, conf = hit
-                    frame_w = frame.shape[1]
-                    ex, ey = cx - frame_w / 2.0, cy - frame.shape[0] / 2.0
+                    # 与 _servo_align 同一目标点（画面中心+相机-夹爪偏移）：
+                    # 否则 ALIGN 用偏移目标、FINAL_ALIGN 用几何中心，两阶段拉扯
+                    cx0, cy0 = self.ctrl.compute_offset_target(
+                        frame.shape[0], frame.shape[1])
+                    ex, ey, _err = self.ctrl.compute_error(cx, cy, cx0, cy0)
                     if abs(ex) < config.ALIGN_PX_TOL \
                             and abs(ey) < config.ALIGN_PX_TOL:
                         print("[SM] FINAL_ALIGN: 确认在中心 (%.1f, %.1f) θ=%.1f°"
@@ -376,24 +404,14 @@ class StateMachine:
                         final_ok = True
                         break
                     # 小幅限幅修正（近距一步不能过头）
-                    q = list(self.serial.joint_state)
-                    dq0 = config.SERVO_KP * ex
-                    dq0 = max(-config.FINAL_ALIGN_MAX_STEP,
-                              min(config.FINAL_ALIGN_MAX_STEP, dq0))
-                    dq12 = config.SERVO_KP * ey * 0.5
-                    dq12 = max(-config.FINAL_ALIGN_MAX_STEP,
-                               min(config.FINAL_ALIGN_MAX_STEP, dq12))
-                    q[0] += dq0
-                    q[1] += dq12
-                    q[2] += dq12
-                    q[3] = 90.0 - q[1] - q[2]      # 保持末端竖直
+                    dq0, dq12 = self.ctrl.align_delta(ex, ey, config.FINAL_ALIGN_MAX_STEP)
+                    q = self.ctrl.apply_joint_deltas(self.serial.joint_state,
+                                                     dq0, dq12)
                     if config.J5_ALIGN_ENABLED:     # θ 符号/象限实测后才启用（config）
                         q[4] = theta_deg - q[0]    # J5 对齐夹爪朝向（θ − J1）
-                    for i in range(6):
-                        if q[i] < config.JOINT_MIN[i] or q[i] > config.JOINT_MAX[i]:
-                            return self._to_error(
-                                "FINAL_ALIGN: joint %d out of range %.1f"
-                                % (i + 1, q[i]))
+                    ok, msg = self.ctrl.check_limits(q, "FINAL_ALIGN")
+                    if not ok:
+                        return self._to_error(msg)
                     try:
                         # 近距精对准朝木块逼近：禁消隙过冲（防撞物）
                         self.traj.move_to(self.serial, q, overshoot=False)
@@ -461,7 +479,16 @@ class StateMachine:
             return self._to_error("TRANSPORT: lift IK failed: %s" % reason)
         if not self._move(q_up, "TRANSPORT", t0):
             return False
-        px, py = config.PLACE_POS
+        # 动态放置：沿当前 J1 方向偏移 PLACE_RADIUS_MM（臂不扭转，恒在可达域）
+        j1_rad = math.radians(self.serial.joint_state[0])
+        px = config.PLACE_RADIUS_MM * math.cos(j1_rad)
+        py = config.PLACE_RADIUS_MM * math.sin(j1_rad)
+        # 可达性自检（放置点可能因臂构型不同而不可达）
+        if not kinematics.is_reachable(px, py, config.PLACE_Z):
+            return self._to_error(
+                "TRANSPORT: place unreachable at r=%.0f z=%.0f — "
+                "adjust PLACE_RADIUS_MM/PLACE_Z" % (
+                    config.PLACE_RADIUS_MM, config.PLACE_Z))
         q_place, _ = kinematics.ik_solve(px, py, config.SAFE_Z, config.GRIP_CLOSE)
         if q_place is None:
             return self._to_error("TRANSPORT: place IK failed")
@@ -484,7 +511,7 @@ class StateMachine:
         # 7. HOME：抬升 → 回中位
         self._set_state("HOME")
         t0 = time.monotonic()
-        q_up2, _ = kinematics.ik_solve(px, py, config.SAFE_Z, config.GRIP_OPEN)
+        q_up2, _ = kinematics.ik_solve(x_now, y_now, config.SAFE_Z, config.GRIP_OPEN)
         if q_up2 is not None:
             if not self._move(q_up2, "HOME", t0):
                 return False

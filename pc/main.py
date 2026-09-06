@@ -67,6 +67,14 @@ def ensure_calibration(cap):
     return cal
 
 
+def make_state_machine(serial, traj, ir):
+    """装配视觉伺服状态机：开摄像头 + 加载模型 + 构造 StateMachine。"""
+    cap = open_camera()
+    vision = Vision()
+    sm = StateMachine(serial, traj, ir, vision=vision, cap=cap)
+    return cap, sm
+
+
 def main():
     ap = argparse.ArgumentParser(description="arm-grasp-pc 上位机")
     ap.add_argument("--dry-run", action="store_true",
@@ -104,10 +112,7 @@ def main():
     # --- 模式分发 ---
     if args.mode == "test":
         log.info("== DRY_RUN 全流程自测 ==")
-        # 视觉伺服路线：需要 vision + cap
-        cap = open_camera()
-        vision = Vision()
-        sm = StateMachine(serial, traj, ir, vision=vision, cap=cap)
+        cap, sm = make_state_machine(serial, traj, ir)
         ok = sm.run_grasp()
         log.info("grasp result: %s", ok)
         cap.release()
@@ -122,14 +127,12 @@ def main():
         return 0
 
     # --- auto / single：需要视觉 ---
-    cap = open_camera()
-    vision = Vision()
-    sm = StateMachine(serial, traj, ir, vision=vision, cap=cap)
+    cap, sm = make_state_machine(serial, traj, ir)
 
     try:
         if args.mode == "single":
             while True:
-                raw = input("目标 mm 坐标 (x y)，q 退出: ").strip()
+                raw = input("输入参考坐标（仅作抓取失败时安全抬升的 mm 参考，定位仍由视觉完成），q 退出: ").strip()
                 if raw.lower() == "q":
                     break
                 try:
@@ -148,8 +151,23 @@ def main():
                     log.warning("抓取失败（已回 HOME），继续下一轮")
                 time.sleep(1.0)
     except KeyboardInterrupt:
-        log.warning("Ctrl+C：软件急停 E")
-        serial.estop()
+        # Ctrl+C 安全退出：非 dry-run 先回 HOME（防止 MG996R 断电打滑下坠），
+        # 再发 E 急停。处理期间再按 Ctrl+C → 直接 E 兜底。
+        if not args.dry_run:
+            log.warning("Ctrl+C：先回 HOME 再急停")
+            try:
+                serial.home()
+                log.info("HOME 完成")
+            except KeyboardInterrupt:
+                log.warning("HOME 期间再次 Ctrl+C，直接急停")
+            except Exception as e:
+                log.warning("HOME 失败: %s，继续急停" % e)
+            finally:
+                log.warning("发送软件急停 E")
+                serial.estop()
+        else:
+            log.warning("Ctrl+C：DRY_RUN 软件急停 E")
+            serial.estop()
     finally:
         cap.release()
         serial.close()

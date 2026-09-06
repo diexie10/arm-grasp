@@ -29,7 +29,7 @@ import time
 import serial  # pip install pyserial
 
 import config
-from kinematics import from_servo, to_servo
+from kinematics import from_servo, to_servo, servo_limits, servo_clamp
 
 
 def _checksum(cmd):
@@ -97,9 +97,7 @@ class ArmSerial:
         if m:
             n, a = int(m.group(1)), float(m.group(2))
             # 从 config 关节限位 + 偏移量导出舵机域限位（单一真源）
-            fw_min = [config.JOINT_MIN[i] + config.JOINT_OFFSET[i] for i in range(6)]
-            fw_max = [config.JOINT_MAX[i] + config.JOINT_OFFSET[i] for i in range(6)]
-            servo = max(float(fw_min[n - 1]), min(float(fw_max[n - 1]), a))
+            servo = servo_clamp(n - 1, a)
             return "OK M%d %.1f" % (n, servo)
         if cmd.startswith("MALL"):
             return "OK MALL"
@@ -119,11 +117,7 @@ class ArmSerial:
         m_g = re.match(r"^G\s+((?:-?\d+\s+){5}-?\d+)$", cmd)
         if m_g:
             vals = [int(x) for x in m_g.group(1).split()]
-            clamped = []
-            for i, v in enumerate(vals):
-                lo = config.JOINT_MIN[i] + config.JOINT_OFFSET[i]
-                hi = config.JOINT_MAX[i] + config.JOINT_OFFSET[i]
-                clamped.append(int(round(max(lo, min(hi, v)))))
+            clamped = [int(round(servo_clamp(i, v))) for i, v in enumerate(vals)]
             return "OK G " + " ".join(str(x) for x in clamped)
         if cmd == "Q":
             return "DONE"
@@ -223,9 +217,8 @@ class ArmSerial:
         echoed = [int(x) for x in m.group(1).split()]
         # 固件 clamp 后应与本地预期一致（±1° 容差防取整边界）
         for i in range(6):
-            expect = max(config.JOINT_MIN[i] + config.JOINT_OFFSET[i],
-                         min(config.JOINT_MAX[i] + config.JOINT_OFFSET[i],
-                             servos[i]))
+            lo, hi = servo_limits(i)
+            expect = max(lo, min(hi, servos[i]))
             if abs(echoed[i] - expect) > 1:
                 return False, ("BAD_ECHO: axis %d echo %d != expect %d"
                                % (i + 1, echoed[i], expect))

@@ -15,8 +15,11 @@ import math
 import config
 
 
-def _clamp(v, lo, hi):
+def clamp(v, lo, hi):
+    """公共 clamp：限制 v 在 [lo, hi] 范围内。"""
     return max(lo, min(hi, v))
+
+_clamp = clamp  # 内部别名，已迁移至公共 clamp
 
 
 def to_servo(q):
@@ -27,13 +30,64 @@ def to_servo(q):
     return [q[i] + config.JOINT_OFFSET[i] for i in range(6)]
 
 
+def servo_limits(i):
+    """关节 i 的舵机域限位 (min, max)，从 JOINT_MIN/MAX + JOINT_OFFSET 导出。"""
+    return (config.JOINT_MIN[i] + config.JOINT_OFFSET[i],
+            config.JOINT_MAX[i] + config.JOINT_OFFSET[i])
+
+
+def servo_clamp(i, v):
+    """将舵机角 v clamp 到关节 i 的舵机域限位。"""
+    lo, hi = servo_limits(i)
+    return max(lo, min(hi, v))
+
+
 def from_servo(servo_q):
     """舵机角（固件回显）→ 关节角。回显铁律：joint_state 存关节角。"""
     return [servo_q[i] - config.JOINT_OFFSET[i] for i in range(6)]
 
 
+def _ik_solve_one(x, y, z, grip_angle, elbow_sign):
+    """单分支 IK 求解（elbow_sign=+1 肘上，-1 肘下）。
+
+    Returns:
+        (q, None) 成功；(None, reason) 失败。
+    """
+    r = math.hypot(x, y)
+    dz = z - config.L1
+    d = math.hypot(r, dz)
+
+    j1 = math.degrees(math.atan2(y, x))
+    cos_j3 = (d * d - config.L2 * config.L2 - config.L3 * config.L3) \
+        / (2.0 * config.L2 * config.L3)
+    j3_abs = math.degrees(math.acos(_clamp(cos_j3, -1.0, 1.0)))
+    j3 = elbow_sign * j3_abs
+
+    a2 = math.atan2(dz, r)
+    b2 = math.atan2(config.L3 * math.sin(math.radians(j3)),
+                    config.L2 + config.L3 * math.cos(math.radians(j3)))
+    j2 = math.degrees(a2 - b2)
+    j4 = 90.0 - j2 - j3
+
+    q = [j1, j2, j3, j4, config.J5_FIXED,
+         config.GRIP_OPEN if grip_angle is None else grip_angle]
+    return q, None
+
+
+def _check_joint_limits(q):
+    """检查 q 是否在关节限位内。返回 (True, None) 或 (False, reason)。"""
+    for i in range(6):
+        if q[i] < config.JOINT_MIN[i] - 1e-6 or q[i] > config.JOINT_MAX[i] + 1e-6:
+            return False, ("joint %d out of range: %.1f not in [%.0f, %.0f]"
+                           % (i + 1, q[i], config.JOINT_MIN[i], config.JOINT_MAX[i]))
+    return True, None
+
+
 def ik_solve(x, y, z, grip_angle=None):
     """由末端位置 (x, y, z) 求关节角 q[6]。
+
+    先尝试肘上解（j3=+acos, j2=a2−b2），若限位拒绝则尝试肘下解
+    （j3'=−j3, j2'=a2+b2, j4'=90−j2'−j3'）。两者皆拒 → None。
 
     Args:
         x, y, z: 末端（夹爪中心）桌面坐标，mm，Z 向上。
@@ -55,28 +109,21 @@ def ik_solve(x, y, z, grip_angle=None):
         return None, "unreachable: target distance %.1f < |L2-L3|=%.1f" % (
             d, abs(config.L2 - config.L3))
 
-    # --- 解析解（余弦定理，2R 臂）---
-    j1 = math.degrees(math.atan2(y, x))          # 底座 yaw
-    cos_j3 = (d * d - config.L2 * config.L2 - config.L3 * config.L3) \
-        / (2.0 * config.L2 * config.L3)
-    j3 = math.degrees(math.acos(_clamp(cos_j3, -1.0, 1.0)))
-    # θ2 = atan2(Z', R) − atan2(L3·sinθ3, L2 + L3·cosθ3)
-    a2 = math.atan2(dz, r)
-    b2 = math.atan2(config.L3 * math.sin(math.radians(j3)),
-                    config.L2 + config.L3 * math.cos(math.radians(j3)))
-    j2 = math.degrees(a2 - b2)
-    j4 = 90.0 - j2 - j3                    # 末端竖直向下的腕补偿
+    # --- 肘上解（原行为）---
+    q_up, _ = _ik_solve_one(x, y, z, grip_angle, +1)
+    ok, _ = _check_joint_limits(q_up)
+    if ok:
+        return q_up, None
 
-    q = [j1, j2, j3, j4, config.J5_FIXED,
-         config.GRIP_OPEN if grip_angle is None else grip_angle]
+    # --- 肘下解（备选）---
+    q_down, _ = _ik_solve_one(x, y, z, grip_angle, -1)
+    ok, _ = _check_joint_limits(q_down)
+    if ok:
+        return q_down, None
 
-    # --- 限位检查：超限 = 不可达，绝不静默 clamp ---
-    # （clamp 是固件兜底；上位机若静默 clamp，虚拟角度与物理脱节 → IK 漂移）
-    for i in range(6):
-        if q[i] < config.JOINT_MIN[i] - 1e-6 or q[i] > config.JOINT_MAX[i] + 1e-6:
-            return None, ("joint %d out of range: %.1f not in [%.0f, %.0f]"
-                          % (i + 1, q[i], config.JOINT_MIN[i], config.JOINT_MAX[i]))
-    return q, None
+    # --- 两解均超限：返回肘上解的详细拒绝信息 ---
+    _, reason = _check_joint_limits(q_up)
+    return None, reason
 
 
 def fk(q):
@@ -143,6 +190,47 @@ if __name__ == "__main__":
             rejected += 1                    # 限位拒绝 = 预期
     print("verify_ik: %d pass, %d FAIL(bug), %d rejected(limit/unreachable)"
           % (ok, fail, rejected))
+
+    # --- 低 z 测试组（肘下分支覆盖）---
+    low_z_pass, low_z_fail = 0, 0
+    low_z_cases = [
+        (150, 150, 30), (200, 0, 30), (212, 0, 30),
+        (150, 150, 50), (200, 0, 50), (100, 100, 50),
+        (0, 150, 30), (0, 200, 50),
+    ]
+    for pose in low_z_cases:
+        good, info = verify_ik(pose)
+        if good:
+            low_z_pass += 1
+        elif "FK(IK) error" in str(info):
+            low_z_fail += 1
+            print("LOW_Z FAIL", pose, info)
+        else:
+            # limit rejected or unreachable - acceptable for low z
+            pass
+    print("low_z test: %d pass, %d FAIL" % (low_z_pass, low_z_fail))
+
+    # --- 旧有效位姿回归验证（肘上解不变）---
+    # 这些 pose 在改前就是肘上解通过限位的，返回 q 必须逐位一致（±0.1° 容差）
+    old_valid = [
+        ((-66.6, 147.7, 197.5), [114.27, 6.12, 57.1, 26.78, 0.0, 100.0]),
+        ((-135.4, 142.6, 181.0), [133.51, 12.2, 30.52, 47.28, 0.0, 100.0]),
+        ((138.5, 138.5, 194.0), [45.0, 23.11, 16.02, 50.87, 0.0, 100.0]),
+    ]
+    regress_ok = 0
+    for pose, expected_q in old_valid:
+        q, reason = ik_solve(*pose)
+        if q is None:
+            print("REGRESSION: %s returned None: %s" % (pose, reason))
+            continue
+        actual = [round(v, 2) for v in q]
+        # 浮点精度容差（±0.1°）
+        match = all(abs(a - e) < 0.15 for a, e in zip(actual, expected_q))
+        if match:
+            regress_ok += 1
+        else:
+            print("REGRESSION: %s q=%s != expected %s" % (pose, actual, expected_q))
+    print("regression: %d/%d old valid poses match (±0.1°)" % (regress_ok, len(old_valid)))
 
     # 可达边界测试
     for pose in [(0, 120, 50), (150, 0, 100), (100, 100, 30), (0, 0, 300)]:

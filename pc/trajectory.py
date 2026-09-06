@@ -7,11 +7,8 @@ MCU 自主梯形执行（30°/s, 15°/s²），PC 轮询 Q 等 DONE。PC 不再�
 
 消隙（架构书 §4）：每关节记录上次运动方向；本次反向运动时先发过冲点
 OVERSHOOT=15°，等 DONE 后再发目标点 —— 最终逼近方向与上次一致。
-
-plan_joint_move 保留仅作 DONE 超时估算参考/测试用途，不再用于执行。
 """
 
-import math
 import time
 
 import config
@@ -19,44 +16,6 @@ import config
 
 class TrajectoryError(RuntimeError):
     """轨迹执行失败（CLAMP / TIMEOUT / BAD_ECHO）。调用方必须转 ERROR。"""
-
-
-def plan_joint_move(from_q, to_q, dt_ms=None, max_vel=None, max_acc=None):
-    """梯形速度规划（保留：DONE 超时估算与离线测试用，执行已下沉 MCU）。"""
-    dt_ms = dt_ms or config.DT_MS
-    v = max_vel or config.MAX_VEL
-    a = max_acc or config.MAX_ACC
-    dt = dt_ms / 1000.0
-
-    dq = [to_q[i] - from_q[i] for i in range(6)]
-    dmax = max(abs(d) for d in dq)
-    if dmax < 1e-6:
-        return [list(from_q)]
-
-    t_acc = v / a
-    if dmax <= a * t_acc * t_acc:          # 三角轮廓（到不了最大速度）
-        t_acc = math.sqrt(dmax / a)
-        t_tot = 2.0 * t_acc
-    else:                                   # 梯形轮廓
-        t_cruise = dmax / v - t_acc
-        t_tot = 2.0 * t_acc + t_cruise
-
-    pts = []
-    t = 0.0
-    while t <= t_tot + 1e-9:
-        if t <= t_acc:                       # 加速（抛物线位置）
-            s = 0.5 * a * t * t
-        elif t <= t_tot - t_acc:             # 匀速
-            s = 0.5 * a * t_acc * t_acc + v * (t - t_acc)
-        else:                                # 减速
-            tr = t_tot - t
-            s = dmax - 0.5 * a * tr * tr
-        scale = s / dmax
-        pts.append([from_q[i] + dq[i] * scale for i in range(6)])
-        t += dt
-    # 保证终点精确（浮点最后一步可能略欠）
-    pts[-1] = [round(x, 6) for x in to_q]
-    return pts
 
 
 class Trajectory:

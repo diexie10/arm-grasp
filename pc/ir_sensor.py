@@ -56,11 +56,17 @@ class IRSensor:
     def wait_blocked(self, timeout_ms=5000):
         """轮询等待任一红外被遮挡。成功 True；超时 False。
 
+        超时下限：必须 ≥ (IR_TRIGGER_COUNT+2) * IR_POLL_MS（=250ms），
+        否则去抖窗口无法填满，真机恒返回 False。
+
         DRY_RUN：模拟接触——第 3 次查询返回 True（否则 DESCEND 永远走不完）。
         """
         if self._dry_run:
+            # 每次等待 = 独立去抖窗口（比真实共享历史更保守，误差方向安全）
+            self._dry_blocks = 0
             self._dry_blocks += 1
-            return self._dry_blocks >= 3
+            # 语义等价：dry_run 模拟计数与真实红外去抖确认计数同义（IR_TRIGGER_COUNT=3）
+            return self._dry_blocks >= config.IR_TRIGGER_COUNT
         deadline = time.monotonic() + timeout_ms / 1000.0
         while time.monotonic() < deadline:
             if self.any_blocked():

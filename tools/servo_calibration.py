@@ -176,6 +176,7 @@ def main():
         json.dump(all_results, f, ensure_ascii=False, indent=2)
     print(f'\n  结果已保存到 {out_path}')
     print('  下一步：根据结果更新 config.py 的 JOINT_MIN/MAX/HOME 和固件 joint_min/max')
+    print('  ⚠️ 同步提醒：改 HOME 必须两端同步（固件 home_servo + PC JOINT_HOME/JOINT_OFFSET）')
 
 
 if __name__ == '__main__':
