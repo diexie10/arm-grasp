@@ -24,6 +24,72 @@ import kinematics
 
 
 # =====================================================================
+#  共享目标链：EMA 平滑 + 限步（sim 与 bridge 共用）
+# =====================================================================
+
+class TargetChainState:
+    """目标链状态机：EMA 平滑 → 限步。
+
+    生命周期：一拍调用一次 update(raw_targets)，返回最终舵机目标。
+    首拍快照初始化（EMA 直通，prev = raw），后续帧正常平滑 + 限步。
+    """
+
+    def __init__(self):
+        self.ema = [0.0] * 6
+        self.prev = [0.0] * 6
+        self._snapshot_done = False
+
+    def reset(self):
+        """重置为首拍状态。"""
+        self.ema = [0.0] * 6
+        self.prev = [0.0] * 6
+        self._snapshot_done = False
+
+    def update(self, raw_targets):
+        """处理一帧原始舵机目标，返回 (smoothed_targets[6], step_clamp_count)。
+
+        Args:
+            raw_targets: scheme_a/scheme_b 输出的原始舵机目标 [6]（deg）。
+
+        Returns:
+            (result[6], step_clamp_count) — 平滑+限步后的目标，以及本帧触发限步的轴数。
+        """
+        # 首拍快照：EMA 直通，prev = raw（与 glove_sim.py 原始行为一致）
+        if not self._snapshot_done:
+            self.ema = list(raw_targets)
+            self.prev = list(raw_targets)
+            self._snapshot_done = True
+            return list(raw_targets), 0
+
+        # EMA 平滑（舵机域）
+        alpha = config.GLOVE_EMA_ALPHA
+        for j in range(6):
+            self.ema[j] = alpha * raw_targets[j] + (1.0 - alpha) * self.ema[j]
+
+        # EMA 输出钳位到舵机限位
+        for j in range(6):
+            lo, hi = kinematics.servo_limits(j)
+            if self.ema[j] < lo:
+                self.ema[j] = lo
+            elif self.ema[j] > hi:
+                self.ema[j] = hi
+
+        # 限步（舵机域逐拍增量 ≤ GLOVE_STEP_MAX_DEG）
+        result = []
+        step_clamp = 0
+        max_step = config.GLOVE_STEP_MAX_DEG
+        for j in range(6):
+            delta = self.ema[j] - self.prev[j]
+            if abs(delta) > max_step:
+                delta = math.copysign(max_step, delta)
+                step_clamp += 1
+            result.append(self.prev[j] + delta)
+        # prev 跟踪限步后的结果（下一帧的基准）
+        self.prev = list(result)
+        return result, step_clamp
+
+
+# =====================================================================
 #  两阶段限位（MoveIt Servo 语义）
 # =====================================================================
 
@@ -70,6 +136,10 @@ def _apply_deadband(error_deg, deadband_deg):
     if abs(error_deg) <= deadband_deg:
         return 0.0
     return error_deg
+
+
+# 公开别名（bridge 等外部调用方使用）
+apply_error_deadband = _apply_deadband
 
 
 def _clamp_servo_targets(q_joint):

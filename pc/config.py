@@ -268,6 +268,10 @@ GLOVE_EMA_ALPHA = 0.2          # EMA 平滑系数（仿真调参值，装机联�
 GLOVE_NEUTRAL_DEG = 5.0        # 中性姿态容差 °（误差在此范围内视为"中性"）
 GLOVE_LINK_TIMEOUT_MS = 500.0  # 断流冻结超时 ms（AD-4f）
 
+# ===================== 手套桥（PC 实时桥接） =====================
+GLOVE_BRIDGE_UDP_PORT = 8766      # UDP 手套数据源默认端口
+GLOVE_BRIDGE_UDP_BUF = 4096       # UDP 接收缓冲区大小 B
+
 # ===================== 两阶段限位（MoveIt Servo jointLimitVelocityScalingFactor 语义） =====================
 GLOVE_LIMIT_MARGIN_DEG = 6.0   # 限位带宽度 °（关节距限位 < 此值 → 全局速度缩放；来源：MoveIt Servo 默认 0.1 rad≈5.7°）
 GLOVE_S1_WRAP_DEG = 180.0      # s1 回绕常数 °（atan2 范围 [-180,180]，超过此值 atan2 返回负值导致 J1 限位拒绝）

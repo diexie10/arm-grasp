@@ -29,7 +29,8 @@ import config
 import kinematics
 
 from glove.imu_filter import MahonyFilter
-from glove.mapping import scheme_a, scheme_a_init, scheme_b, scheme_b_init
+from glove.mapping import (scheme_a, scheme_a_init, scheme_b, scheme_b_init,
+                           TargetChainState)
 
 
 # =====================================================================
@@ -195,13 +196,11 @@ def run_pipeline(seconds, noise_scale, scheme, keyframes=None):
     state_a = scheme_a_init() if scheme in ("a", "both") else None
     state_b = scheme_b_init() if scheme in ("b", "both") else None
 
-    # EMA 状态（首拍快照初始化，见主循环 ema_snapshot 标记）
-    ema_a = [0.0] * 6  # 方案 A EMA（首拍会被覆盖）
-    ema_b = [0.0] * 6  # 方案 B EMA（首拍会被覆盖）
-    prev_a_servo = [0.0] * 6  # 首拍会被覆盖
-    prev_b_servo = [0.0] * 6
-    prev_a = [0.0] * 6  # 首拍会被覆盖
-    prev_b = [0.0] * 6
+    # 目标链状态（EMA + 限步，共享 helper）
+    chain_a = TargetChainState() if scheme in ("a", "both") else None
+    chain_b = TargetChainState() if scheme in ("b", "both") else None
+    prev_targets_a = None  # 上一帧限步后目标（抖动追踪；None = 首帧不计）
+    prev_targets_b = None
 
     # 指标收集
     static_errors_a = []
@@ -265,8 +264,6 @@ def run_pipeline(seconds, noise_scale, scheme, keyframes=None):
     send_counter = 0
     true_euler_prev = None
     warmup_steps = int(0.5 * config.GLOVE_IMU_HZ)  # 前 0.5s 滤波器收敛期，不计入指标
-    ema_snapshot_a = False  # 方案 A：首拍 EMA 快照标记
-    ema_snapshot_b = False  # 方案 B：首拍 EMA 快照标记
 
     for step in range(n_imu):
         t = step * dt_imu
@@ -327,30 +324,9 @@ def run_pipeline(seconds, noise_scale, scheme, keyframes=None):
             targets_a_raw, q_a, sc_a, hc_a = scheme_a(map_pitch, map_roll, map_yaw, state_a)
             halt_a += hc_a
 
-            # EMA 平滑（在舵机域）
-            if not ema_snapshot_a:
-                ema_a = list(targets_a_raw)
-                prev_a_servo = list(targets_a_raw)
-                prev_a = list(targets_a_raw)
-                ema_snapshot_a = True
-            else:
-                for j in range(6):
-                    ema_a[j] = (config.GLOVE_EMA_ALPHA * targets_a_raw[j]
-                                + (1.0 - config.GLOVE_EMA_ALPHA) * ema_a[j])
-
-            # EMA 输出钳位到舵机限位
-            for j in range(6):
-                lo, hi = kinematics.servo_limits(j)
-                if ema_a[j] < lo:
-                    ema_a[j] = lo
-                elif ema_a[j] > hi:
-                    ema_a[j] = hi
-
-            # 限步（舵机域逐拍增量 ≤ GLOVE_STEP_MAX_DEG）
-            targets_a, sc_a_step = _step_limit_with_count(ema_a, prev_a_servo,
-                                                          config.GLOVE_STEP_MAX_DEG)
+            # 目标链：EMA 平滑 + 限步（共享 helper）
+            targets_a, sc_a_step = chain_a.update(targets_a_raw)
             step_clamp_a += sc_a_step
-            prev_a_servo = list(targets_a)
 
             # servo_limits 饱和检测
             for j in range(6):
@@ -369,15 +345,16 @@ def run_pipeline(seconds, noise_scale, scheme, keyframes=None):
                 if targets_a[j] > span_a_max[j]:
                     span_a_max[j] = targets_a[j]
 
-            # 抖动 + 响应性
-            delta_a = [targets_a[j] - prev_a[j] for j in range(6)]
-            servo_jitter_a.append(delta_a)
-            for j in range(6):
-                ad = abs(delta_a[j])
-                if ad > max_delta_a:
-                    max_delta_a = ad
-                sum_abs_delta_a += ad
-            prev_a = list(targets_a)
+            # 抖动 + 响应性（首帧不计，避免初始化跳变）
+            if prev_targets_a is not None:
+                delta_a = [targets_a[j] - prev_targets_a[j] for j in range(6)]
+                servo_jitter_a.append(delta_a)
+                for j in range(6):
+                    ad = abs(delta_a[j])
+                    if ad > max_delta_a:
+                        max_delta_a = ad
+                    sum_abs_delta_a += ad
+            prev_targets_a = list(targets_a)
 
         # --- 方案 B ---
         targets_b_raw = None
@@ -392,30 +369,9 @@ def run_pipeline(seconds, noise_scale, scheme, keyframes=None):
                 # IK 成功 → 完整处理
                 ee_pos = ee_pos_b
 
-                # EMA 平滑
-                if not ema_snapshot_b:
-                    ema_b = list(targets_b_raw)
-                    prev_b_servo = list(targets_b_raw)
-                    prev_b = list(targets_b_raw)
-                    ema_snapshot_b = True
-                else:
-                    for j in range(6):
-                        ema_b[j] = (config.GLOVE_EMA_ALPHA * targets_b_raw[j]
-                                    + (1.0 - config.GLOVE_EMA_ALPHA) * ema_b[j])
-
-                # EMA 输出钳位到舵机限位
-                for j in range(6):
-                    lo, hi = kinematics.servo_limits(j)
-                    if ema_b[j] < lo:
-                        ema_b[j] = lo
-                    elif ema_b[j] > hi:
-                        ema_b[j] = hi
-
-                # 限步
-                targets_b, sc_b_step = _step_limit_with_count(ema_b, prev_b_servo,
-                                                              config.GLOVE_STEP_MAX_DEG)
+                # 目标链：EMA 平滑 + 限步（共享 helper）
+                targets_b, sc_b_step = chain_b.update(targets_b_raw)
                 step_clamp_b += sc_b_step
-                prev_b_servo = list(targets_b)
 
                 # servo_limits 饱和检测
                 for j in range(6):
@@ -444,15 +400,16 @@ def run_pipeline(seconds, noise_scale, scheme, keyframes=None):
                     if targets_b[j] > span_b_max[j]:
                         span_b_max[j] = targets_b[j]
 
-                # 抖动 + 响应性
-                delta_b = [targets_b[j] - prev_b[j] for j in range(6)]
-                servo_jitter_b.append(delta_b)
-                for j in range(6):
-                    ad = abs(delta_b[j])
-                    if ad > max_delta_b:
-                        max_delta_b = ad
-                    sum_abs_delta_b += ad
-                prev_b = list(targets_b)
+                # 抖动 + 响应性（首帧不计）
+                if prev_targets_b is not None:
+                    delta_b = [targets_b[j] - prev_targets_b[j] for j in range(6)]
+                    servo_jitter_b.append(delta_b)
+                    for j in range(6):
+                        ad = abs(delta_b[j])
+                        if ad > max_delta_b:
+                            max_delta_b = ad
+                        sum_abs_delta_b += ad
+                prev_targets_b = list(targets_b)
 
                 # EE 路径长度（3D）— 首拍不计（ee_prev=None）
                 if ee_prev is not None and ee_pos is not None:
@@ -467,7 +424,7 @@ def run_pipeline(seconds, noise_scale, scheme, keyframes=None):
             else:
                 # IK 失败 → 保持上一拍
                 ik_fail_count_b += 1
-                targets_b = prev_b_servo
+                targets_b = list(chain_b.prev)
 
         # --- trace ---
         entry = {
@@ -552,23 +509,6 @@ def _apply_deadband(error_deg, deadband_deg):
     if abs(error_deg) <= deadband_deg:
         return 0.0
     return error_deg
-
-
-def _step_limit_with_count(targets, prev, max_step):
-    """限步：逐拍增量不超过 max_step [deg]。
-
-    Returns:
-        (result[6], clamp_count) — 结果和触发限步的轴数。
-    """
-    result = []
-    count = 0
-    for j in range(6):
-        delta = targets[j] - prev[j]
-        if abs(delta) > max_step:
-            delta = math.copysign(max_step, delta)
-            count += 1
-        result.append(prev[j] + delta)
-    return result, count
 
 
 def _mean_triple(error_list):
