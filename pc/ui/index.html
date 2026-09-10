@@ -1,0 +1,760 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ARM-GRASP 调试台</title>
+<style>
+:root{
+  --bg:#f6f8fa; --panel:#ffffff; --line:#d0d7de; --txt:#1f2328; --dim:#656d76;
+  --acc:#0969da; --warn:#9a6700; --danger:#cf222e; --ok:#1a7f37;
+  --mono:Consolas,"Courier New",monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);font:13px/1.5 "Segoe UI",system-ui,sans-serif}
+header{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:14px;
+  padding:8px 16px;background:#fff;border-bottom:1px solid var(--line)}
+.brand{font-weight:700;font-size:15px;letter-spacing:1px;color:var(--acc)}
+.conn{display:flex;align-items:center;gap:8px;margin-left:auto}
+.led{width:10px;height:10px;border-radius:50%;background:#b6bec8;display:inline-block}
+.led.on{background:var(--ok)}
+.led.err{background:var(--danger)}
+#connNote{color:var(--dim);font-size:11px;max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.btn{background:#f6f8fa;color:var(--txt);border:1px solid var(--line);border-radius:6px;
+  padding:4px 11px;cursor:pointer;font-size:12px}
+.btn:hover{background:#eaeef2;border-color:#b1bac4}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btnE{background:var(--danger);border:1px solid #a40e26;color:#fff;font-weight:800;font-size:15px;
+  padding:10px 22px;border-radius:8px;cursor:pointer;letter-spacing:2px}
+.btnE:hover{background:#e5534b}
+.btnE.estop{animation:flash 1s infinite}
+@keyframes flash{50%{background:#7d1414}}
+main{display:grid;grid-template-columns:minmax(560px,1fr) 350px;gap:10px;padding:10px;align-items:start}
+@media(max-width:1000px){main{grid-template-columns:1fr}}
+.col{display:flex;flex-direction:column;gap:10px;min-width:0}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;min-width:0}
+.panel h2{margin:0 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:2px;color:var(--dim)}
+.offline .needConn{opacity:.45;pointer-events:none}
+svg.view{width:100%;display:block;touch-action:none;user-select:none}
+svg.view text{font-family:var(--mono)}
+.hint{font-size:11px;color:var(--dim);margin-top:6px}
+.pills{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px}
+.pill{font-size:11px;padding:2px 9px;border-radius:10px;border:1px solid var(--line);color:var(--dim);background:#fff}
+.pill.ok{color:var(--ok);border-color:#a4d1b4}
+.pill.busy{color:var(--warn);border-color:#d4a72c;animation:flash 1.2s infinite}
+.pill.bad{color:var(--danger);border-color:#e3a4a4;animation:flash .8s infinite}
+.axrow{display:grid;grid-template-columns:70px 64px 1fr;gap:8px;align-items:center;margin-bottom:5px}
+.axrow .nm{font-size:12px}
+.axrow .nm small{color:var(--dim);font-size:10px;display:block}
+.axrow input{width:100%;background:#fff;color:var(--txt);border:1px solid var(--line);border-radius:5px;
+  padding:3px 6px;font-family:var(--mono);font-size:12px;text-align:right}
+.axrow .act{font-family:var(--mono);font-size:11px;color:var(--dim);text-align:right}
+.toolbar{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:8px 0}
+.rgrid{display:grid;grid-template-columns:auto 1fr auto 1fr;gap:6px 8px;align-items:center;font-size:12px}
+.rgrid input[type=number],select{width:100%;background:#fff;color:var(--txt);border:1px solid var(--line);
+  border-radius:5px;padding:3px 6px;font-family:var(--mono);text-align:right}
+select{text-align:left}
+#rngBar{grid-column:1/-1;height:8px;background:#eaeef2;border-radius:4px;position:relative;overflow:hidden}
+#rngFill{position:absolute;left:0;top:0;bottom:0;width:0;background:var(--acc);transition:width .15s}
+#rngLog{height:150px;overflow:auto;background:#f6f8fa;border:1px solid var(--line);border-radius:6px;
+  padding:6px;font-family:var(--mono);font-size:11px;margin-top:8px}
+#rngLog div{white-space:pre-wrap;margin-bottom:2px}
+#rngLog .clamp{color:var(--warn)}
+#rngLog .warn{color:var(--danger)}
+#rngLog .ok{color:var(--ok)}
+#tbox{height:170px;overflow:auto;background:#f6f8fa;border:1px solid var(--line);border-radius:6px;
+  padding:6px;font-family:var(--mono);font-size:11px;margin-bottom:8px}
+#tbox div{white-space:pre-wrap;margin-bottom:2px}
+#tbox .tx{color:var(--acc)} #tbox .rx{color:var(--txt)} #tbox .sys{color:var(--warn)} #tbox .err{color:var(--danger)}
+.trow{display:flex;gap:6px}
+#cmdIn{flex:1;background:#fff;color:var(--txt);border:1px solid var(--line);border-radius:6px;padding:5px 8px;font-family:var(--mono)}
+footer{text-align:center;color:var(--dim);font-size:11px;padding:6px 0 14px}
+#toasts{position:fixed;right:12px;bottom:12px;z-index:50;display:flex;flex-direction:column;gap:6px}
+.toast{background:#fff;border:1px solid var(--acc);border-radius:8px;padding:8px 12px;font-size:12px;
+  max-width:340px;box-shadow:0 4px 14px rgba(31,35,40,.12)}
+.toast.warn{border-color:var(--warn);color:var(--warn)}
+</style>
+</head>
+<body class="offline">
+<header>
+  <span class="brand">ARM-GRASP 调试台</span>
+  <div class="conn">
+    <select id="selPort" style="max-width:180px"></select>
+    <button class="btn" id="btnPorts">刷新</button>
+    <label style="font-size:11px;color:var(--dim);display:flex;align-items:center;gap:3px">
+      <input type="checkbox" id="cbDry"> 模拟</label>
+    <button class="btn" id="btnConn">连接</button>
+    <span class="led" id="connLed"></span>
+    <span id="connNote">未连接</span>
+  </div>
+  <button class="btnE" id="btnE" title="快捷键 E">■ 急停 E</button>
+</header>
+
+<main>
+  <div class="col">
+    <section class="panel">
+      <h2>俯视图 · S1 底座方位 + S5 夹爪截面（拖拽控制）</h2>
+      <svg class="view needConn" id="cvTop" viewBox="0 0 680 330"></svg>
+      <div class="hint">S1：大圆坐标系 0° 朝右，拖指针旋转臂方位；S5：臂末端短杆 = 夹爪俯视截面朝向。</div>
+    </section>
+    <section class="panel">
+      <h2>侧视图 · S2 大臂 / S3 小臂 / S4 腕（拖拽控制）</h2>
+      <svg class="view needConn" id="cvSide" viewBox="0 0 680 450"></svg>
+      <div class="hint">机械表式读数盘（0° 刻度朝右，90°=竖直向上，指针=舵机角读数，与连杆方向解耦）。
+        结构（按草图）：S2 枢轴在底部基座，大臂零位竖直向上 ±90° 放平；S3 在大臂顶端，小臂零位水平向右；
+        S4 在小臂末端，手部零位与臂共线；"<" 形夹爪开口朝臂后方，S6 控张合。
+        拖拽 = 下游刚性跟随预览；松手只发被拖轴，其余按固件实际回位。零位/转向待装机标定 config.LINK_ZERO_DEG/DIAL_SIGN。</div>
+    </section>
+  </div>
+
+  <div class="col">
+    <section class="panel" id="pCtl">
+      <h2>控制 / 状态</h2>
+      <div class="pills">
+        <span class="pill" id="pillBusy">—</span>
+        <span class="pill" id="pillEstop">正常</span>
+        <span class="pill" id="pillIr1">IR1 ?</span>
+        <span class="pill" id="pillIr2">IR2 ?</span>
+      </div>
+      <div class="toolbar">
+        <button class="btn needConn" id="btnHome">H 回中</button>
+        <button class="btn needConn" id="btnGripOpen">爪开</button>
+        <button class="btn needConn" id="btnGripClose">爪合</button>
+      </div>
+      <div id="axRows"></div>
+      <div class="hint">S6 夹爪走上面按钮或此输入（舵机角 40=合 / 100=开）。输入框 = 舵机域精确控制，回车发送。</div>
+    </section>
+
+    <section class="panel" id="pRange">
+      <h2>舵机范围测试（实测回显为准）</h2>
+      <div class="rgrid">
+        <span>轴</span>
+        <select id="rngAxis"></select>
+        <span>从 → 到 (°)</span>
+        <span style="display:flex;gap:5px">
+          <input type="number" id="rngFrom" value="40" min="0" max="180">
+          <input type="number" id="rngTo" value="100" min="0" max="180">
+        </span>
+        <span>步长 (°)</span>
+        <input type="number" id="rngStep" value="5" min="1" max="45">
+        <span>停留 (ms)</span>
+        <input type="number" id="rngDwell" value="100" min="0" step="50">
+        <div id="rngBar"><div id="rngFill"></div></div>
+        <span id="rngCur" style="font-family:var(--mono);font-size:11px;color:var(--dim)"></span>
+      </div>
+      <div class="toolbar">
+        <button class="btn needConn" id="rngStart">▶ 开始扫描</button>
+        <button class="btn" id="rngStop" disabled>■ 停止</button>
+      </div>
+      <div id="rngLog"></div>
+      <div class="hint">每步发 M 后轮询 Q 等到位（bite 轴每步 ~0.66s 属正常）；回显 ≠ 请求 = 固件钳位，黄字标出。</div>
+    </section>
+
+    <section class="panel" id="pTerm">
+      <h2>串口终端（自动附加 *XX 校验和）</h2>
+      <div id="tbox"></div>
+      <div class="trow">
+        <input id="cmdIn" placeholder="如  S · M1 90 · G 101 212 167 187 90 90 · H · E" spellcheck="false">
+        <button class="btn needConn" id="btnSend">发送</button>
+        <button class="btn" id="btnClear">清空</button>
+      </div>
+    </section>
+  </div>
+</main>
+
+<footer>急停快捷键 E · 关闭页面不会停止机械臂，物理急停 = 断舵机电源 · 图为零位约定未标定的推测预览</footer>
+<div id="toasts"></div>
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const NS = 'http://www.w3.org/2000/svg';
+const d2r = d => d * Math.PI / 180;
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+let CFG = null;
+let connected = false;
+let servos = [90, 90, 90, 90, 90, 90];
+let previewServos = null;
+let previewAxis = 0;
+let dragging = null;
+let abortRange = false, rangeRunning = false;
+let lastWarning = null;
+
+/* ---------------- 基础 IO ---------------- */
+async function api(path, body, timeoutMs) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), timeoutMs || 8000);
+  try {
+    const opt = {signal: ctl.signal, headers: {'Content-Type': 'application/json'}};
+    if (body !== undefined) { opt.method = 'POST'; opt.body = JSON.stringify(body); }
+    const r = await fetch(path, opt);
+    if (r.status >= 500) throw new Error('HTTP ' + r.status);
+    return await r.json();
+  } finally { clearTimeout(t); }
+}
+function toast(msg, warn) {
+  const d = document.createElement('div');
+  d.className = 'toast' + (warn ? ' warn' : '');
+  d.textContent = msg;
+  $('toasts').appendChild(d);
+  setTimeout(() => d.remove(), 4200);
+}
+function tstamp() {
+  const d = new Date(), p = (n, w) => String(n).padStart(w || 2, '0');
+  return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds()) + '.' + p(d.getMilliseconds(), 3);
+}
+function tlog(dir, text, cls) {
+  const box = $('tbox'), near = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  const d = document.createElement('div');
+  d.className = cls || (dir === 'TX' ? 'tx' : dir === 'RX' ? 'rx' : 'sys');
+  d.textContent = '[' + tstamp() + '] ' + dir.padEnd(3) + ' ' + text;
+  box.appendChild(d);
+  while (box.childElementCount > 400) box.firstChild.remove();
+  if (near) box.scrollTop = box.scrollHeight;
+}
+
+/* ---------------- 运动模型（config 单一来源，按用户草图 2026-09-09） ----------------
+   表盘（机械表读数盘）：指针角 = 舵机角（0° 刻度朝右，90°=竖直向上），与连杆解耦
+   连杆方向 = LINK_ZERO_DEG[i] + DIAL_SIGN[i] × (舵机角−90)，数学角右=0 逆时针正      */
+const dialSign = i => CFG.dial_sign[i];
+const linkDeg = (i, s) => CFG.link_zero_deg[i] + dialSign(i) * (s - 90);
+const servoFromLink = (i, w) =>
+  clamp(Math.round(90 + dialSign(i) * (w - CFG.link_zero_deg[i])), 0, 180);
+function servoLimits(i) {
+  return [Math.max(0, CFG.joint_min[i] + CFG.joint_offset[i]),
+          Math.min(180, CFG.joint_max[i] + CFG.joint_offset[i])];
+}
+function effLinks(sv) {          // 拖拽中下游刚性跟随（仅预览）
+  const n = {2: linkDeg(1, sv[1]), 3: linkDeg(2, sv[2]), 4: linkDeg(3, sv[3])};
+  if (previewAxis >= 2 && previewAxis <= 4 && sv !== servos) {
+    const d = n[previewAxis] - linkDeg(previewAxis - 1, servos[previewAxis - 1]);
+    for (let j = previewAxis; j <= 4; j++) n[j] += d;
+  }
+  return n;
+}
+
+/* ---------------- SVG 工具 ---------------- */
+function el(tag, attrs, parent) {
+  const e = document.createElementNS(NS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+function setAttrs(e, attrs) { for (const k in attrs) e.setAttribute(k, attrs[k]); }
+function polar(cx, cy, r, worldDeg) {
+  return [cx + r * Math.cos(d2r(worldDeg)), cy - r * Math.sin(d2r(worldDeg))];
+}
+
+/* ---------------- 几何（纯函数，绘图与拖拽共用） ---------------- */
+const SIDE = {W: 680, H: 450};
+const TOPW = {W: 680, H: 330};
+function sideLayout() {
+  const maxR = CFG.l2 + CFG.l3;
+  const xmin = -maxR, xmax = maxR + CFG.l4, ymin = -CFG.l4, ymax = CFG.l1 + maxR;
+  const s = Math.min((SIDE.W - 30) / (xmax - xmin), (SIDE.H - 56) / (ymax - ymin));
+  return {s, ox: 15 - xmin * s, oy: SIDE.H - 30 + ymin * s, maxR};
+}
+function topLayout() {
+  const maxR = CFG.l2 + CFG.l3;
+  const cx = TOPW.W / 2, cy = TOPW.H / 2 + 4;
+  return {cx, cy, s: (Math.min(TOPW.W, TOPW.H) / 2 - 26) / maxR, maxR};
+}
+function chainPx(sv) {
+  const L = sideLayout(), n = effLinks(sv);
+  const P = (wx, wy) => [L.ox + wx * L.s, L.oy - wy * L.s];
+  const sh = P(0, CFG.l1);                                   // S2 枢轴：底部基座上
+  const elbow = P(CFG.l2 * Math.cos(d2r(n[2])), CFG.l1 + CFG.l2 * Math.sin(d2r(n[2])));
+  const wrist = [elbow[0] + CFG.l3 * Math.cos(d2r(n[3])) * L.s,
+                 elbow[1] - CFG.l3 * Math.sin(d2r(n[3])) * L.s];
+  const tip = [wrist[0] + CFG.l4 * Math.cos(d2r(n[4])) * L.s,
+               wrist[1] - CFG.l4 * Math.sin(d2r(n[4])) * L.s];
+  const h4 = [wrist[0] + CFG.l4 * 0.55 * Math.cos(d2r(n[4])) * L.s,
+              wrist[1] - CFG.l4 * 0.55 * Math.sin(d2r(n[4])) * L.s];
+  return {L, n, sh, elbow, wrist, tip, h4};
+}
+function topPoints(sv) {
+  const L = topLayout(), n = effLinks(sv);
+  const xh = CFG.l2 * Math.cos(d2r(n[2])) + CFG.l3 * Math.cos(d2r(n[3]));
+  const yh = CFG.l2 * Math.sin(d2r(n[2])) + CFG.l3 * Math.sin(d2r(n[3]));
+  const rh = clamp(Math.hypot(xh, yh), 0, L.maxR);
+  const ray = polar(L.cx, L.cy, rh * L.s, linkDeg(0, sv[0]));
+  return {L, ray, rh};
+}
+
+/* ---------------- 侧视图：建一次，之后只改属性 ---------------- */
+const S = {};
+function buildSide() {
+  const svg = $('cvSide');
+  svg.innerHTML = '';
+  const L = sideLayout();
+  const P = (wx, wy) => [L.ox + wx * L.s, L.oy - wy * L.s];
+  S.ground = el('line', {stroke: '#d0d7de', 'stroke-width': 1.5,
+    x1: P(-L.maxR, 0)[0], y1: P(0, 0)[1], x2: P(L.maxR + CFG.l4, 0)[0], y2: P(0, 0)[1]}, svg);
+  const gh = homeGhostPx();
+  S.ghost = el('polyline', {points: gh.map(p => p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' '),
+    fill: 'none', stroke: '#d0d7de', 'stroke-width': 4, 'stroke-dasharray': '6 5',
+    'stroke-linecap': 'round', 'stroke-linejoin': 'round'}, svg);
+  const gt = el('text', {x: 8, y: 16, 'font-size': 10, fill: '#b1bac4'}, svg);
+  gt.textContent = '灰虚 = HOME';
+  // 底座板 + S2 枢轴（草图：S2 在底部基座上）
+  S.basePlate = el('line', {stroke: '#1a7f37', 'stroke-width': 8, 'stroke-linecap': 'round'}, svg);
+  S.baseTxt = el('text', {'font-size': 11, fill: '#1a7f37'}, svg);
+  // 表盘（机械表读数盘）×3：圆 + 0°刻度(蓝) + 90/180/270 灰刻度 + 指针 + 读数
+  S.dc = [2, 3, 4].map(() => el('circle', {r: 20, fill: 'rgba(255,255,255,.85)',
+    stroke: '#d0d7de', 'stroke-width': 1.5}, svg));
+  S.tickA = [2, 3, 4].map(() => [0, 90, 180, 270].map(a =>
+    el('line', {stroke: a === 0 ? '#0969da' : '#c7ced6', 'stroke-width': a === 0 ? 2.5 : 1.5}, svg)));
+  S.dn = [2, 3, 4].map(() => el('line', {stroke: '#0969da', 'stroke-width': 2.5, 'stroke-linecap': 'round'}, svg));
+  S.lab = [2, 3, 4].map(() => el('text', {'font-size': 11, fill: '#0969da'}, svg));
+  // 连杆 + 命中区 + 手柄
+  S.ln = [[8, '#1f2328'], [7, '#1f2328'], [5, '#1f2328']].map(([w, c]) =>
+    el('line', {stroke: c, 'stroke-width': w, 'stroke-linecap': 'round'}, svg));
+  S.hit = [2, 3, 4].map(a => el('line', {stroke: 'rgba(0,0,0,0)', 'stroke-width': 20,
+    'data-drag': a, style: 'cursor:grab'}, svg));
+  S.hd = [2, 3, 4].map(a => el('circle', {r: 8, fill: '#fff', stroke: '#0969da',
+    'stroke-width': 2.5, 'data-drag': a, style: 'cursor:grab'}, svg));
+  // "<" 形夹爪（开口朝臂后方，S6 控张合）
+  S.jaw = [0, 1].map(() => el('line', {stroke: '#1f2328', 'stroke-width': 5, 'stroke-linecap': 'round'}, svg));
+  S.lab6 = el('text', {'font-size': 10, fill: '#656d76'}, svg);
+}
+function homeGhostPx() {
+  const L = sideLayout();
+  const P = (wx, wy) => [L.ox + wx * L.s, L.oy - wy * L.s];
+  const h = CFG.joint_home;
+  const a2 = linkDeg(1, h[1]), a3 = linkDeg(2, h[2]), a4 = linkDeg(3, h[3]);
+  const sh = P(0, CFG.l1);
+  const e = P(CFG.l2 * Math.cos(d2r(a2)), CFG.l1 + CFG.l2 * Math.sin(d2r(a2)));
+  const w = [e[0] + CFG.l3 * Math.cos(d2r(a3)) * L.s, e[1] - CFG.l3 * Math.sin(d2r(a3)) * L.s];
+  const t = [w[0] + CFG.l4 * Math.cos(d2r(a4)) * L.s, w[1] - CFG.l4 * Math.sin(d2r(a4)) * L.s];
+  return [sh, e, w, t];
+}
+function updateSide(sv) {
+  const C = chainPx(sv);
+  const setLine = (e, a, b) => setAttrs(e, {x1: a[0].toFixed(1), y1: a[1].toFixed(1),
+    x2: b[0].toFixed(1), y2: b[1].toFixed(1)});
+  // 底座板（过 S2 枢轴的水平板）
+  setLine(S.basePlate, [C.sh[0] - 60, C.sh[1]], [C.sh[0] + 60, C.sh[1]]);
+  setAttrs(S.baseTxt, {x: (C.sh[0] + 66).toFixed(1), y: (C.sh[1] + 4).toFixed(1)});
+  S.baseTxt.textContent = 'S2';
+  // 表盘
+  const pv = {2: C.sh, 3: C.elbow, 4: C.wrist};
+  [2, 3, 4].forEach((a, k) => {
+    const p = pv[a];
+    setAttrs(S.dc[k], {cx: p[0].toFixed(1), cy: p[1].toFixed(1)});
+    // 刻度：0°(蓝,右) + 90/180/270(灰)，r 14→20
+    [0, 90, 180, 270].forEach((ang, ti) => {
+      const g = S.tickA[k][ti];
+      setLine(g, polar(p[0], p[1], 14, ang), polar(p[0], p[1], 20, ang));
+    });
+    // 指针 = 舵机角读数（0 朝右，90 朝上）
+    const np = polar(p[0], p[1], 15, sv[a - 1]);
+    setLine(S.dn[k], p, np);
+    S.lab[k].textContent = 'S' + a + ' ' + sv[a - 1] + '°';
+    setAttrs(S.lab[k], {x: (p[0] + 24).toFixed(1), y: (p[1] - 16).toFixed(1)});
+  });
+  // 连杆/命中区/手柄
+  setLine(S.ln[0], C.sh, C.elbow);
+  setLine(S.ln[1], C.elbow, C.wrist);
+  setLine(S.ln[2], C.wrist, C.tip);
+  setLine(S.hit[0], C.sh, C.elbow);
+  setLine(S.hit[1], C.elbow, C.wrist);
+  setLine(S.hit[2], C.wrist, C.h4);
+  [2, 3, 4].forEach(a => {
+    const p = {2: C.elbow, 3: C.wrist, 4: C.h4}[a];
+    setAttrs(S.hd[a - 2], {cx: p[0].toFixed(1), cy: p[1].toFixed(1)});
+  });
+  // "<" 爪：尖端在手部末端，双臂朝臂后方展开，张角随 S6
+  const [lo6, hi6] = servoLimits(5);
+  const spread = 24 + (clamp(sv[5], lo6, hi6) - 30) / 90 * 36;
+  [S.jaw[0], S.jaw[1]].forEach((j, k) => {
+    const q = polar(C.tip[0], C.tip[1], 30, C.n[4] + 180 + (k ? spread / 2 : -spread / 2));
+    setLine(j, C.tip, q);
+  });
+  setAttrs(S.lab6, {x: (C.tip[0] + 8).toFixed(1), y: (C.tip[1] + 18).toFixed(1)});
+  S.lab6.textContent = 'S6 ' + sv[5] + '°';
+}
+
+/* ---------------- 俯视图 ---------------- */
+const T = {};
+function buildTop() {
+  const svg = $('cvTop');
+  svg.innerHTML = '';
+  const L = topLayout();
+  el('circle', {cx: L.cx, cy: L.cy, r: L.maxR * L.s, fill: 'none', stroke: '#d0d7de', 'stroke-width': 1.5}, svg);
+  el('circle', {cx: L.cx, cy: L.cy, r: L.maxR * L.s * 0.55, fill: 'none', stroke: '#eaeef2', 'stroke-width': 1}, svg);
+  for (let a = 0; a < 360; a += 30) {
+    const p1 = polar(L.cx, L.cy, L.maxR * L.s, a), p2 = polar(L.cx, L.cy, L.maxR * L.s - (a % 90 ? 6 : 12), a);
+    el('line', {x1: p1[0], y1: p1[1], x2: p2[0], y2: p2[1],
+                stroke: a === 0 ? '#0969da' : '#8b949e', 'stroke-width': a === 0 ? 2.5 : 1.5}, svg);
+    if (a % 90 === 0) {
+      const lp = polar(L.cx, L.cy, L.maxR * L.s + 14, a);
+      const t = el('text', {x: lp[0] - 8, y: lp[1] + 4, 'font-size': 11, fill: a === 0 ? '#0969da' : '#656d76'}, svg);
+      t.textContent = a + '°';
+    }
+  }
+  const zt = el('text', {x: 8, y: 16, 'font-size': 10, fill: '#656d76'}, svg);
+  zt.textContent = 'S1 零位 0°=右（待标定）';
+  el('circle', {cx: L.cx, cy: L.cy, r: 11, fill: '#8b949e'}, svg);
+  T.ray = el('line', {stroke: 'rgba(0,0,0,0)', 'stroke-width': 22, 'data-drag': 1, style: 'cursor:grab'}, svg);
+  T.rayV = el('line', {stroke: '#1f2328', 'stroke-width': 5, 'stroke-linecap': 'round'}, svg);
+  T.hd1 = el('circle', {r: 8, fill: '#fff', stroke: '#0969da', 'stroke-width': 2.5,
+    'data-drag': 1, style: 'cursor:grab'}, svg);
+  T.lab1 = el('text', {'font-size': 11, fill: '#0969da'}, svg);
+  T.barHit = el('line', {stroke: 'rgba(0,0,0,0)', 'stroke-width': 20, 'data-drag': 5, style: 'cursor:grab'}, svg);
+  T.bar = el('line', {stroke: '#1f2328', 'stroke-width': 7, 'stroke-linecap': 'round'}, svg);
+  T.hd5 = el('circle', {r: 8, fill: '#fff', stroke: '#9a6700', 'stroke-width': 2.5,
+    'data-drag': 5, style: 'cursor:grab'}, svg);
+  T.lab5 = el('text', {'font-size': 11, fill: '#9a6700'}, svg);
+}
+function updateTop(sv) {
+  const L = topLayout();
+  const P = topPoints(sv);
+  const setLine = (e, a, b) => setAttrs(e, {x1: a[0].toFixed(1), y1: a[1].toFixed(1),
+    x2: b[0].toFixed(1), y2: b[1].toFixed(1)});
+  setLine(T.ray, [L.cx, L.cy], P.ray);
+  setLine(T.rayV, [L.cx, L.cy], P.ray);
+  setAttrs(T.hd1, {cx: P.ray[0].toFixed(1), cy: P.ray[1].toFixed(1)});
+  T.lab1.textContent = 'S1 ' + sv[0] + '° · r ' + P.rh.toFixed(0);
+  setAttrs(T.lab1, {x: (L.cx + 8).toFixed(1), y: (L.cy - 16).toFixed(1)});
+  const th5 = linkDeg(4, sv[4]);
+  const bar = 34;
+  const b1 = [P.ray[0] - bar * Math.cos(d2r(th5)), P.ray[1] + bar * Math.sin(d2r(th5))];
+  const b2 = [P.ray[0] + bar * Math.cos(d2r(th5)), P.ray[1] - bar * Math.sin(d2r(th5))];
+  setLine(T.barHit, b1, b2);
+  setLine(T.bar, b1, b2);
+  setAttrs(T.hd5, {cx: b2[0].toFixed(1), cy: b2[1].toFixed(1)});
+  T.lab5.textContent = 'S5 ' + sv[4] + '°';
+  setAttrs(T.lab5, {x: (P.ray[0] + 10).toFixed(1), y: (P.ray[1] - 10).toFixed(1)});
+}
+
+/* ---------------- 重绘（轮询=同步；拖拽=rAF 合帧） ---------------- */
+function paintNow() {
+  if (!CFG) return;
+  const sv = previewServos || servos;
+  updateSide(sv);
+  updateTop(sv);
+}
+let rafPending = false;
+function redraw() {
+  if (rafPending) return;
+  rafPending = true;
+  requestAnimationFrame(() => { rafPending = false; paintNow(); });
+}
+window.addEventListener('error', e =>
+  tlog('SYS', 'JS错误: ' + e.message + ' @' + (e.filename || '').split('/').pop() + ':' + e.lineno, 'err'));
+
+/* ---------------- 拖拽 ---------------- */
+function dragPivot(axis, sv) {
+  if (axis === 1) { const L = topLayout(); return [L.cx, L.cy]; }
+  if (axis === 5) return topPoints(sv).ray;
+  const C = chainPx(sv);
+  return {2: C.sh, 3: C.elbow, 4: C.wrist}[axis];
+}
+function bindDrag(svgId) {
+  const svg = $(svgId);
+  svg.addEventListener('pointerdown', e => {
+    const t = e.target.closest ? e.target.closest('[data-drag]') : null;
+    if (!t) return;
+    const axis = +t.getAttribute('data-drag');
+    const rect = svg.getBoundingClientRect();
+    dragging = {axis,
+                kx: (svgId === 'cvSide' ? SIDE.W : TOPW.W) / rect.width,
+                ky: (svgId === 'cvSide' ? SIDE.H : TOPW.H) / rect.height};
+    previewAxis = axis;
+    svg.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  });
+  svg.addEventListener('pointermove', e => {
+    if (!dragging) return;
+    const r = svg.getBoundingClientRect();
+    const vx = (e.clientX - r.left) * dragging.kx, vy = (e.clientY - r.top) * dragging.ky;
+    const sv = previewServos || servos.slice();
+    const p = dragPivot(dragging.axis, sv);
+    const world = Math.atan2(p[1] - vy, vx - p[0]) * 180 / Math.PI;
+    const i = dragging.axis - 1;
+    const [lo, hi] = servoLimits(i);
+    const target = clamp(servoFromLink(i, world), lo, hi);
+    if (!previewServos) previewServos = sv;
+    previewServos[i] = target;
+    redraw();
+  });
+  const end = () => {
+    if (!dragging) return;
+    const i = dragging.axis - 1;
+    const target = previewServos ? previewServos[i] : null;
+    dragging = null;
+    previewAxis = 0;
+    if (target != null && Math.abs(target - servos[i]) >= 1) {
+      sendServo(i + 1, target);
+    } else {
+      previewServos = null;
+      redraw();
+    }
+  };
+  svg.addEventListener('pointerup', end);
+  svg.addEventListener('pointercancel', end);
+}
+
+/* ---------------- 发送 ---------------- */
+async function sendServo(n, v) {
+  if (!connected) { toast('未连接', true); previewServos = null; redraw(); return; }
+  v = Math.round(v);
+  tlog('TX', 'M' + n + ' ' + v);
+  try {
+    const r = await api('/api/cmd', {cmd: 'M' + n + ' ' + v});
+    tlog('RX', r.resp, r.ok ? null : 'err');
+    if (r.resp && /CLAMP|ERR/.test(r.resp)) toast('M' + n + ': ' + r.resp, true);
+  } catch (e) { tlog('SYS', '发送异常: ' + e.message, 'err'); }
+  pollStatus();
+}
+
+/* ---------------- 连接 ---------------- */
+function setConn(state, note) {
+  connected = state;
+  document.body.classList.toggle('offline', !state);
+  $('connLed').className = 'led' + (state ? ' on' : ' err');
+  $('connNote').textContent = note || (state ? '已连接' : '未连接');
+  $('btnConn').textContent = state ? '断开' : '连接';
+}
+async function loadPorts() {
+  try {
+    const ps = await api('/api/ports');
+    const sel = $('selPort');
+    sel.innerHTML = '';
+    ps.forEach(p => {
+      const o = document.createElement('option');
+      o.value = p.port; o.textContent = p.port + (p.desc ? ' · ' + p.desc : '');
+      sel.appendChild(o);
+    });
+    if ([...sel.options].some(o => o.value === CFG.default_port)) sel.value = CFG.default_port;
+  } catch (e) { /* 离线浏览允许失败 */ }
+}
+$('btnPorts').onclick = loadPorts;
+$('btnConn').onclick = async () => {
+  if (connected) {
+    await api('/api/disconnect', {});
+    setConn(false, '已断开'); tlog('SYS', '已断开');
+    return;
+  }
+  const port = $('selPort').value, dry = $('cbDry').checked;
+  tlog('SYS', (dry ? 'DRY_RUN 模拟连接' : '连接 ' + port));
+  try {
+    const r = await api('/api/connect', {port, dry}, 10000);
+    if (r.ok) {
+      setConn(true, r.dry_run ? '模拟模式（不发串口）' : '已连接 ' + port);
+      tlog('SYS', r.dry_run ? '模拟连接成功' : '已连接 ' + port);
+      pollStatus();
+    } else { setConn(false, r.error || '连接失败'); toast(r.error || '连接失败', true); tlog('SYS', '连接失败: ' + (r.error || ''), 'err'); }
+  } catch (e) { setConn(false, '连接异常'); toast('连接异常: ' + e.message, true); }
+};
+
+/* ---------------- 轮询 ---------------- */
+async function pollStatus() {
+  if (!CFG) return;
+  let st;
+  try { st = await api('/api/status', undefined, 6000); }
+  catch (e) { $('connLed').className = 'led err'; return; }
+  applyStatus(st);
+}
+function applyStatus(st) {
+  if (!st.connected) { if (!st.error || connected) setConn(false, st.error || '未连接'); return; }
+  setConn(true, st.dry_run ? '模拟模式（不发串口）' : '已连接');
+  servos = st.servos;
+  previewServos = null;
+  previewAxis = 0;
+  const estopOn = !!st.estop;
+  $('pillEstop').className = 'pill' + (estopOn ? ' bad' : ' ok');
+  $('pillEstop').textContent = estopOn ? '急停激活（H 恢复）' : '正常';
+  $('btnE').classList.toggle('estop', estopOn);
+  $('pillBusy').className = 'pill' + (st.busy ? ' busy' : ' ok');
+  $('pillBusy').textContent = st.busy ? 'BUSY 运动中' : 'DONE 空闲';
+  setIr($('pillIr1'), 'IR1', st.ir1_blocked);
+  setIr($('pillIr2'), 'IR2', st.ir2_blocked);
+  for (let n = 1; n <= 6; n++) {
+    const inp = $('in' + n);
+    if (document.activeElement !== inp) inp.value = servos[n - 1].toFixed(0);
+    $('act' + n).textContent = '实际 ' + servos[n - 1].toFixed(0) + '°';
+  }
+  paintNow();
+  if (st.warning && st.warning !== lastWarning) {
+    lastWarning = st.warning;
+    toast(st.warning, true);
+    tlog('SYS', st.warning, 'err');
+  }
+  if (!st.telemetry_ok) lastWarning = null;
+}
+function setIr(elm, name, blocked) {
+  if (blocked === true)       { elm.className = 'pill bad'; elm.textContent = name + ' 遮挡'; }
+  else if (blocked === false) { elm.className = 'pill ok';  elm.textContent = name + ' 通'; }
+  else                        { elm.className = 'pill';     elm.textContent = name + ' ?'; }
+}
+
+/* ---------------- 控制面板 ---------------- */
+function buildAxisRows() {
+  const box = $('axRows');
+  box.innerHTML = '';
+  for (let n = 1; n <= 6; n++) {
+    const [lo, hi] = servoLimits(n - 1);
+    const row = document.createElement('div');
+    row.className = 'axrow';
+    row.innerHTML =
+      '<div class="nm">' + CFG.axis_names[n - 1].replace(/^J/, 'S') +
+        '<small>舵机 ' + lo + '~' + hi + '°</small></div>' +
+      '<input id="in' + n + '" class="needConn" type="number" min="0" max="180" value="90">' +
+      '<div class="act" id="act' + n + '">—</div>';
+    box.appendChild(row);
+    const inp = row.querySelector('input');
+    inp.addEventListener('change', () => {
+      const v = clamp(Math.round(+inp.value || 0), 0, 180);
+      inp.value = v;
+      sendServo(n, v);
+    });
+  }
+  const sel = $('rngAxis');
+  for (let n = 1; n <= 6; n++) {
+    const o = document.createElement('option');
+    o.value = n; o.textContent = n + ' · ' + CFG.axis_names[n - 1].replace(/^J/, 'S');
+    sel.appendChild(o);
+  }
+  sel.value = '6';
+}
+$('btnE').onclick = estop;
+window.addEventListener('keydown', e => {
+  if ((e.key === 'e' || e.key === 'E') &&
+      !['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName)) estop();
+});
+async function estop() {
+  if (!connected) { toast('未连接，急停无法发送——物理急停请直接断舵机电源', true); return; }
+  abortRange = true;
+  tlog('TX', 'E  (急停)', 'err');
+  try {
+    const r = await api('/api/estop', {});
+    tlog('RX', r.ok ? 'OK E' : (r.error || '失败'), r.ok ? null : 'err');
+    if (!r.ok) toast(r.error || '急停发送失败', true);
+  } catch (e) { tlog('SYS', '急停发送异常: ' + e.message, 'err'); }
+}
+$('btnHome').onclick = async () => {
+  if (!connected) return toast('未连接', true);
+  const estopOn = $('pillEstop').classList.contains('bad');
+  if (estopOn) {
+    if (!confirm('急停恢复软启动：臂可能已下垂，将逐轴回中（每轴间隔 200ms，\n恢复瞬间有不受约束的弹回）。\n确认运动包络内无人、无障碍？')) return;
+    tlog('TX', '软启动 (E→H 逐轴回中)');
+    const r = await api('/api/softstart', {}, 30000);
+    tlog('RX', r.ok ? '软启动完成' : ('软启动失败: ' + (r.error || r.msg)), r.ok ? 'sys' : 'err');
+  } else {
+    if (!confirm('H：六轴梯形滑回 HOME 悬停位。确认？')) return;
+    tlog('TX', 'H');
+    const r = await api('/api/home', {});
+    tlog('RX', r.ok ? 'OK H' : (r.error || '失败'), r.ok ? null : 'err');
+  }
+  pollStatus();
+};
+$('btnGripOpen').onclick = () => sendServo(6, CFG.grip_open);
+$('btnGripClose').onclick = () => sendServo(6, CFG.grip_close);
+
+/* ---------------- 范围测试 ---------------- */
+function rlog(text, cls) {
+  const box = $('rngLog'), d = document.createElement('div');
+  if (cls) d.className = cls;
+  d.textContent = text;
+  box.appendChild(d);
+  box.scrollTop = box.scrollHeight;
+}
+async function waitDone(maxMs) {
+  const t0 = performance.now();
+  while (performance.now() - t0 < maxMs) {
+    if (abortRange) return false;
+    try {
+      const r = await api('/api/cmd', {cmd: 'Q'}, 4000);
+      if (r.resp && r.resp.includes('DONE')) return true;
+      if (r.resp == null) return false;
+    } catch (e) { return false; }
+    await sleep(120);
+  }
+  return false;
+}
+$('rngStart').onclick = runRange;
+$('rngStop').onclick = () => { abortRange = true; };
+async function runRange() {
+  if (rangeRunning) return;
+  if (!connected) return toast('未连接', true);
+  const n = +$('rngAxis').value;
+  let from = Math.round(+$('rngFrom').value), to = Math.round(+$('rngTo').value);
+  const step = clamp(Math.round(+$('rngStep').value), 1, 45);
+  const dwell = Math.max(0, +$('rngDwell').value || 0);
+  if (from > to) { const t = from; from = to; to = t; }
+  rangeRunning = true; abortRange = false;
+  $('rngStart').disabled = true; $('rngStop').disabled = false;
+  $('rngLog').innerHTML = '';
+  rlog('范围测试: M' + n + '  ' + from + ' → ' + to + ' → ' + from + '  步长 ' + step + '°');
+  const seq = [];
+  for (let v = from; v < to; v += step) seq.push(v);
+  seq.push(to); seq.push(from);
+  let clamps = 0, errs = 0, minE = Infinity, maxE = -Infinity;
+  for (let i = 0; i < seq.length; i++) {
+    if (abortRange) { rlog('已中止', 'warn'); break; }
+    const v = seq[i];
+    $('rngFill').style.width = ((i + 1) / seq.length * 100).toFixed(1) + '%';
+    $('rngCur').textContent = 'M → ' + v + '°';
+    tlog('TX', 'M' + n + ' ' + v);
+    const r = await api('/api/cmd', {cmd: 'M' + n + ' ' + v});
+    const resp = r.resp || 'TIMEOUT';
+    tlog('RX', resp);
+    const em = resp.match(/^OK M\d\s+(-?[\d.]+)$/);
+    if (em) {
+      const echo = +em[1];
+      minE = Math.min(minE, echo); maxE = Math.max(maxE, echo);
+      if (Math.abs(echo - v) > 0.5) { clamps++; rlog('M' + n + ' ' + v + ' → 回显 ' + echo + '（钳位）', 'clamp'); }
+    } else { errs++; rlog('步进 ' + v + ': 异常应答「' + resp + '」', 'warn'); }
+    if (!(await waitDone(6000))) { errs++; rlog('等待 DONE 超时', 'warn'); }
+    if (dwell) await sleep(dwell);
+  }
+  $('rngStart').disabled = false; $('rngStop').disabled = true;
+  rangeRunning = false;
+  const span = (minE <= maxE) ? ' · 实测回显区间 [' + minE + ', ' + maxE + ']' : '';
+  rlog('结果: ' + seq.length + ' 步 · 钳位 ' + clamps + ' · 异常 ' + errs + span,
+       (clamps || errs) ? 'clamp' : 'ok');
+  pollStatus();
+}
+
+/* ---------------- 终端 ---------------- */
+$('btnSend').onclick = sendRaw;
+$('cmdIn').addEventListener('keydown', e => { if (e.key === 'Enter') sendRaw(); });
+async function sendRaw() {
+  const cmd = $('cmdIn').value.trim();
+  if (!cmd) return;
+  if (!connected) return toast('未连接', true);
+  tlog('TX', cmd);
+  try {
+    const r = await api('/api/cmd', {cmd});
+    tlog('RX', r.resp, r.ok ? null : 'err');
+  } catch (e) { tlog('SYS', '发送异常: ' + e.message, 'err'); }
+  $('cmdIn').select();
+}
+$('btnClear').onclick = () => { $('tbox').innerHTML = ''; };
+
+/* ---------------- 启动 ---------------- */
+(async function init() {
+  try { CFG = await api('/api/config'); }
+  catch (e) {
+    document.body.innerHTML =
+      '<p style="padding:30px">无法连接 ui_server.py — 请先启动: python ui_server.py</p>';
+    return;
+  }
+  servos = CFG.joint_home.map((q, i) => q + CFG.joint_offset[i]);
+  buildAxisRows();
+  buildSide();
+  buildTop();
+  bindDrag('cvSide');
+  bindDrag('cvTop');
+  await loadPorts();
+  paintNow();
+  setConn(false, '未连接');
+  setInterval(pollStatus, 400);
+  tlog('SYS', '调试台就绪。连接串口或勾选「模拟」体验全部功能。');
+})();
+</script>
+</body>
+</html>

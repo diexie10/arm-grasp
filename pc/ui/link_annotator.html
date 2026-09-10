@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>三连杆标注台（双击即用，无需服务器）</title>
+<style>
+:root{--line:#d0d7de;--txt:#1f2328;--dim:#656d76;--acc:#0969da}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.5 "Segoe UI",system-ui,sans-serif;color:var(--txt);background:#fff}
+svg{display:block;width:100vw;height:calc(100vh - 64px);touch-action:none;user-select:none}
+.bar{height:64px;display:flex;align-items:center;gap:10px;padding:0 16px;border-top:1px solid var(--line)}
+.bar .conv{color:var(--dim);font-size:12px}
+#out{flex:1;font-family:Consolas,monospace;font-size:13px;border:1px solid var(--line);
+  border-radius:6px;padding:6px 10px;background:#f6f8fa;color:var(--txt)}
+button{border:1px solid var(--line);background:#f6f8fa;border-radius:6px;padding:6px 14px;
+  cursor:pointer;font-size:13px}
+button:hover{background:#eaeef2}
+svg text{font-family:Consolas,monospace}
+</style>
+</head>
+<body>
+<svg id="cv" viewBox="0 0 1200 700"></svg>
+<div class="bar">
+  <span class="conv">角度约定：0°=正右方，逆时针增大，显示 0~360°。<br>拖任意圆点=该连杆 360° 无限自由旋转（互不影响）。</span>
+  <input id="out" readonly>
+  <button id="btnCopy">复制角度</button>
+</div>
+<script>
+'use strict';
+const NS = 'http://www.w3.org/2000/svg';
+const cv = document.getElementById('cv');
+const BASE = [260, 360];   // 基点（数组，joints() 按下标取）
+// 三连杆：th = 累计弧度（无界，可无限转），显示时折算 0~360
+const LINKS = [
+  {len: 190, th: Math.PI / 2, name: '关节1'},
+  {len: 150, th: 0,           name: '关节2'},
+  {len: 120, th: 0,           name: '关节3'},
+];
+
+function el(tag, attrs) {
+  const e = document.createElementNS(NS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  cv.appendChild(e);
+  return e;
+}
+function setAttrs(e, attrs) { for (const k in attrs) e.setAttribute(k, attrs[k]); }
+
+// 每连杆：命中区（粗透明线）+ 可见线 + 手柄 + 枢轴点 + 标签
+const els = LINKS.map((L, i) => ({
+  hit:  el('line', {stroke: 'rgba(0,0,0,0)', 'stroke-width': 26, style: 'cursor:grab'}),
+  line: el('line', {stroke: '#1f2328', 'stroke-width': 9, 'stroke-linecap': 'round'}),
+  zero: el('line', {stroke: '#c7ced6', 'stroke-width': 1, 'stroke-dasharray': '4 4'}),
+  dot:  el('circle', {r: 6, fill: '#8b949e'}),
+  hd:   el('circle', {r: 11, fill: '#fff', stroke: '#0969da', 'stroke-width': 3, style: 'cursor:grab'}),
+  txt:  el('text', {'font-size': 15, fill: '#0969da'}),
+  idx:  i,
+}));
+
+function joints() {
+  const p = [BASE];
+  for (const L of LINKS) {
+    const q = p[p.length - 1];
+    p.push([q[0] + L.len * Math.cos(L.th), q[1] - L.len * Math.sin(L.th)]);
+  }
+  return p;
+}
+function wrap360(rad) {
+  let d = Math.round(rad * 180 / Math.PI) % 360;
+  if (d < 0) d += 360;
+  return d;
+}
+function update() {
+  const p = joints();
+  els.forEach((E, i) => {
+    const a = p[i], b = p[i + 1];
+    setAttrs(E.line, {x1: a[0], y1: a[1], x2: b[0], y2: b[1]});
+    setAttrs(E.hit,  {x1: a[0], y1: a[1], x2: b[0], y2: b[1]});
+    setAttrs(E.dot,  {cx: a[0], cy: a[1]});
+    setAttrs(E.hd,   {cx: b[0], cy: b[1]});
+    // 0° 参考虚线（水平向右，短）
+    setAttrs(E.zero, {x1: a[0], y1: a[1], x2: a[0] + 46, y2: a[1]});
+    E.txt.textContent = E.idx === 0 ? LINKS[i].name + ' 基点' :
+      LINKS[i].name + '（原点=上一关节）';
+    setAttrs(E.txt, {x: a[0] + 10, y: a[1] - 14});
+  });
+  document.getElementById('out').value =
+    LINKS.map((L, i) => L.name + '=' + wrap360(L.th) + '°').join('   ');
+}
+
+/* 拖拽 = 增量旋转（无界累计，360° 无限转，无跳变） */
+let drag = null;   // {idx, last}
+cv.addEventListener('pointerdown', e => {
+  const t = e.target;
+  const E = els.find(x => x.hd === t || x.hit === t || x.line === t);
+  if (!E) return;
+  const p = joints();
+  drag = {idx: E.idx, last: Math.atan2(-(e.clientY - p[E.idx][1]) * 1, (e.clientX - p[E.idx][0]))};
+  // 注意：client 坐标与 viewBox 的比例换算
+  drag.last = ptrAngle(e, E.idx);
+  cv.setPointerCapture(e.pointerId);
+  e.preventDefault();
+});
+cv.addEventListener('pointermove', e => {
+  if (!drag) return;
+  const cur = ptrAngle(e, drag.idx);
+  let d = cur - drag.last;
+  while (d > Math.PI) d -= 2 * Math.PI;
+  while (d < -Math.PI) d += 2 * Math.PI;
+  LINKS[drag.idx].th += d;
+  drag.last = cur;
+  update();
+});
+const end = () => { drag = null; };
+cv.addEventListener('pointerup', end);
+cv.addEventListener('pointercancel', end);
+
+function ptrAngle(e, idx) {
+  const p = joints()[idx];
+  const rect = cv.getBoundingClientRect();
+  const kx = 1200 / rect.width, ky = 700 / rect.height;
+  const vx = (e.clientX - rect.left) * kx, vy = (e.clientY - rect.top) * ky;
+  return Math.atan2(p[1] - vy, vx - p[0]);   // 世界角：右=0 逆时针正
+}
+
+document.getElementById('btnCopy').onclick = async () => {
+  const s = document.getElementById('out').value;
+  try { await navigator.clipboard.writeText(s); } catch (err) { /* file:// 可能受限，输入框可手动复制 */ }
+  document.getElementById('out').select();
+};
+
+update();
+</script>
+</body>
+</html>
