@@ -64,6 +64,66 @@ class ArmSerial:
                     "无法打开串口 %s: %s\n"
                     "检查：设备管理器 COM 号 / 是否被占用 / 板子是否枚举" % (
                         port or config.COM_PORT, e))
+        # Runtime limit handshake — verify PC config matches firmware tables
+        self.verify_limits()
+
+    # ---------- 运动限位握手 ----------
+    def query_limits(self):
+        """Send 'L' to query firmware servo-domain limits and home.
+
+        MCU reply format:
+            OK L MIN m0..m5 MAX x0..x5 HOME h0..h5
+
+        Returns:
+            dict {"min": [int]*6, "max": [int]*6, "home": [int]*6} on success,
+            None on failure / ERR / unparseable response.
+        """
+        resp = self._send("L")
+        if resp is None or resp.startswith("ERR"):
+            return None
+        m = re.match(
+            r"^OK L\s+MIN\s+([-\d\s]+)\s+MAX\s+([-\d\s]+)\s+HOME\s+([-\d\s]+)$",
+            resp.strip())
+        if not m:
+            return None
+        try:
+            vals = [int(x) for x in m.group(1).split()]
+            valx = [int(x) for x in m.group(2).split()]
+            valh = [int(x) for x in m.group(3).split()]
+        except ValueError:
+            return None
+        if len(vals) != 6 or len(valx) != 6 or len(valh) != 6:
+            return None
+        return {"min": vals, "max": valx, "home": valh}
+
+    def verify_limits(self):
+        """Verify PC config matches firmware-compiled servo limits.
+
+        Non-fatal on old firmware (L command unsupported / parse failure):
+        prints a warning and returns False.
+        Fatal on mismatch — raises SystemExit to prevent running with
+        diverged limits (the root cause of the J2/J4 90° P0).
+
+        Returns:
+            True if all match, False if firmware doesn't support L.
+        Raises:
+            SystemExit if any limit mismatch is detected.
+        """
+        mcu = self.query_limits()
+        if mcu is None:
+            print("WARNING: 固件无 L 命令或解析失败，跳过握手（旧固件需重新烧录？）")
+            return False
+        labels = ["SERVO_MIN", "SERVO_MAX", "HOME_SERVO"]
+        pc_vals = [config.SERVO_MIN, config.SERVO_MAX, config.HOME_SERVO]
+        mcu_vals = [mcu["min"], mcu["max"], mcu["home"]]
+        for label, pc, mcu_lim in zip(labels, pc_vals, mcu_vals):
+            for i in range(6):
+                if pc[i] != mcu_lim[i]:
+                    raise SystemExit(
+                        "固件与 PC config 限位不一致——必须同步后重烧，禁止带病运行\n"
+                        "  joint %d %s: PC=%.0f, MCU=%d" % (i + 1, label, pc[i], mcu_lim[i]))
+        print("OK: 固件限位与 PC config 一致（L 握手通过）")
+        return True
 
     # ---------- 底层 ----------
     def _send(self, cmd, timeout=None):
@@ -122,6 +182,11 @@ class ArmSerial:
             return "OK G " + " ".join(str(x) for x in clamped)
         if cmd == "Q":
             return "DONE"
+        if cmd == "L":
+            return ("OK L MIN %s MAX %s HOME %s"
+                    % (" ".join(str(int(v)) for v in config.SERVO_MIN),
+                       " ".join(str(int(v)) for v in config.SERVO_MAX),
+                       " ".join(str(int(v)) for v in config.HOME_SERVO)))
         return "ERR unknown"
 
     # ---------- 命令 ----------

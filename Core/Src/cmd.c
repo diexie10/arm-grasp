@@ -32,6 +32,11 @@ volatile uint8_t estop_active    = 0U;  /* E command: PWM stopped      */
 volatile uint8_t timeout_active   = 0U; /* no command for 15s (see CMD_TIMEOUT_MS) */
 volatile uint32_t last_cmd_tick   = 0U; /* HAL tick of last command    */
 
+/* Home (hover) servo angles — single source shared by H (go-home) and L
+ * (limit handshake). Must stay in sync with PC-side config.HOME_SERVO;
+ * drift is caught by the L handshake + pc/tests/test_firmware_contract.py. */
+static const uint16_t home_servo[6] = {101U, 122U, 167U, 97U, 90U, 90U}; /* 悬停位: 大臂122 小臂167 */
+
 /* Private function prototypes -----------------------------------------------*/
 static void CDC_Reply(const char *fmt, ...);
 static uint8_t HexNibble(char c);
@@ -58,11 +63,11 @@ int8_t CDC_SendString(const char *str)
 
 /**
   * @brief  Format and send a reply string to the PC over USART3.
-  * @param  fmt  printf-style format string (max 63 chars output)
+  * @param  fmt  printf-style format string (max 95 chars output)
   */
 static void CDC_Reply(const char *fmt, ...)
 {
-  char reply[64];
+  char reply[96];
   va_list ap;
   va_start(ap, fmt);
   vsnprintf(reply, sizeof(reply), fmt, ap);
@@ -215,10 +220,9 @@ static void Cmd_Execute(const char *line)
   }
   else if ((line[0] == 'H') || (line[0] == 'h'))
   {
-    /* D1: home_servo[i] corresponds to PC-side config.JOINT_HOME + JOINT_OFFSET
-     * (J5 firmware 90 = PC 0 + offset 90, same physical position).
+    /* D1: home_servo[] is defined at file scope (shared with the L handshake).
+     * It corresponds to PC-side config.HOME_SERVO / JOINT_HOME + JOINT_OFFSET.
      * Changing HOME requires sync on BOTH sides. */
-    static const uint16_t home_servo[6] = {101U, 122U, 167U, 97U, 90U, 90U}; /* 悬停位: 大臂122 小臂167 */
     uint8_t hi;
     uint8_t was_estop = estop_active;
     estop_active = 0U;
@@ -254,6 +258,22 @@ static void Cmd_Execute(const char *line)
     }
     motion_done = 1U;            /* nothing is moving; timeout protection resumes */
     CDC_Reply("OK E\r\n");
+  }
+  else if ((line[0] == 'L') || (line[0] == 'l'))
+  {
+    /* Runtime handshake: report the COMPILED limit/home tables so the host
+     * verifies its config at connect (zero cross-boundary drift; see
+     * docs/architecture/6-工程规范与最佳实践.md). Format:
+     *   OK L MIN m0..m5 MAX x0..x5 HOME h0..h5
+     * joint_min/joint_max are servo-domain clamps (servo.c). */
+    CDC_Reply("OK L MIN %u %u %u %u %u %u MAX %u %u %u %u %u %u "
+              "HOME %u %u %u %u %u %u\r\n",
+              joint_min[0], joint_min[1], joint_min[2],
+              joint_min[3], joint_min[4], joint_min[5],
+              joint_max[0], joint_max[1], joint_max[2],
+              joint_max[3], joint_max[4], joint_max[5],
+              home_servo[0], home_servo[1], home_servo[2],
+              home_servo[3], home_servo[4], home_servo[5]);
   }
   else
   {

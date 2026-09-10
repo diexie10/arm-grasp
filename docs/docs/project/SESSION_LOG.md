@@ -5,6 +5,22 @@
 
 ---
 
+## 2026-09-10（运行期握手 + pytest 套件 —— 规范 §2a/§6 落地）
+
+### 运行期握手（跨端常量零漂移）
+- 固件 `Core/Src/cmd.c` 新增 **`L` 命令**：回 `OK L MIN m0..m5 MAX x0..x5 HOME h0..h5`（= 编译期 `joint_min/max` + `home_servo`，**舵机域**）；`home_servo[]` 提升到文件作用域供 H/L 共用。
+- 附带修：`CDC_Reply` 缓冲 64→96B（L 应答 ~91 字符，原 64B 会被 `vsnprintf` 截断）。
+- PC `pc/arm_serial.py`：`query_limits()` 解析 + `verify_limits()`——**旧固件无 L → 警告跳过（非致命）**；**限位不一致 → `SystemExit` 硬停**（禁止带病运行）；`__init__` 连接即握手；DRY_RUN 用 config 自答（自校验解析器）。
+- 验证：**Keil clean rebuild 0 Error**（`arm-grasp.axf`）；`pytest pc/tests -q` **32 passed**；`test_firmware_contract` 3/3。
+
+### pytest 套件（`pc/tests/`，32 用例，纯层无硬件）
+`conftest.py`（注入 pc/ 到 sys.path）+ `test_kinematics`（FK(IK) 闭环 / 回归 / **限位域守卫 `servo_limits(1)==(3,183)`**）+ `test_servo_controller`（限幅 / ΔJ4=−2ΔJ2 / 腕修正量子化+slack / 耗时单调）+ `test_imu_filter`（静态水平→roll/pitch<0.5° + 确定性）+ `test_limits_handshake`（dry 自答 / 解析 / 失配 `SystemExit`）+ 既有 `test_firmware_contract`。
+
+### 待办
+- **真机**：烧录含 `L` 的新固件后，连接应打印「L 握手通过」；不一致时硬停。
+
+---
+
 ## 2026-09-10（关键 bug 修复：限位域混乱 —— J2/J4 差 90°）
 
 ### 性质：P0（真机必挂；此前 DRY_RUN/仿真因"自以为一致"而未暴露）
