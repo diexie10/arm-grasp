@@ -236,6 +236,7 @@ def _make_source(source_str, seconds):
 # =====================================================================
 
 _stop_flag = threading.Event()
+_estop_requested = threading.Event()   # 'e' 键按下 → 清理路径必须发 E（docstring 承诺的安全语义）
 
 
 def _keyboard_listener():
@@ -246,6 +247,7 @@ def _keyboard_listener():
             if msvcrt.kbhit():
                 ch = msvcrt.getch()
                 if ch in (b"e", b"E"):
+                    _estop_requested.set()
                     _stop_flag.set()
                     return
             time.sleep(0.05)
@@ -372,12 +374,12 @@ def run_bridge(args):
                     if prev_servo[j] is None or abs(targets[j] - prev_servo[j]) >= config.GLOVE_DEADBAND_DEG:
                         ok, msg = arm.move_joint(j + 1, targets[j] - config.JOINT_OFFSET[j])
                         if not ok:
+                            # 任何发送失败（REJECT/CLAMP/TIMEOUT/BAD_ECHO）→ 保守中止手套模式。
+                            # 回显铁律：调用方暂停；带病续流可能把错误角度灌给固件。
+                            echo_mismatch += 1
                             print("[中止] 关节 %d 发送失败: %s" % (j + 1, msg))
-                            if "CLAMP" in msg:
-                                echo_mismatch += 1
-                                print("[中止] 回显超限，退出手套模式")
-                                running = False
-                                break
+                            running = False
+                            break
                 send_count += 1
             else:
                 send_count += 1
@@ -399,6 +401,12 @@ def run_bridge(args):
         print("\n[Ctrl+C] 优雅退出（不发 H，保持最后姿态）")
 
     # --- 清理 ---
+    if _estop_requested.is_set() and arm is not None:
+        # 'e' 急停：docstring 承诺的语义。E 失败必须大声提示物理断电。
+        if arm.estop():
+            print("[急停] E 已发送（PWM 全停，恢复需 H + 软启动）")
+        else:
+            print("[急停] E 发送失败！请立即物理断开舵机电源")
     source.close()
     if arm is not None:
         arm.close()
