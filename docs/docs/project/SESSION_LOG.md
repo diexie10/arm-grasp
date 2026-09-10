@@ -5,6 +5,27 @@
 
 ---
 
+## 2026-09-10（续：ESP32 手套固件——下载排障 + 6 缺陷修复 + 真实 parity 验证）
+
+### 背景
+接手会话后接管 arm-grasp（codegraph 已按项目范围落地）。用户确认手套硬件：**ESP-WROOM-32E + CP2102 + Type-C**。
+
+### 排障：esptool 依赖下载卡死（不是 ESP32 工具链）
+- 现象：fixer 的 `pio run` 卡死 5min+；日志显示 `espressif32` 平台/`toolchain-xtensa-esp32`/`framework-arduinoespressif32` 均**已装好**，卡在 PyPI `cryptography-46.0.7-cp38-abi3-win_amd64.whl`
+- 根因：`tool-esptoolpy/package-postinstall.py` 用系统 pip 把 5 个依赖装进包内 `_contrib`，直连 `files.pythonhosted.org` 卡死
+- 修复：走清华镜像把 5 依赖（cryptography/ecdsa/bitstring/reedsolo/intelhex + 传递依赖）装入 `tool-esptoolpy\_contrib` → `pio run` 通过
+
+### 固件（glove-esp32/，Arduino + PlatformIO）
+- 首版能编译但编排层审查出 **6 个真缺陷**：①`udp.begin()` 从未调用 → UDP 静默失效（WiFi 通路全死）②广播用字符串 `"255.255.255.255"` → 每包域名解析 ③`last_send_ms` 未用（warning）④WiFi 首连被重试门延迟 ~5s + loop 内 `delay(1)` ⑤accel 灵敏度注释写错 ⑥测试造假（Python 对 Python / 编方程副本且调本机不存在的 gcc）
+- 修复：`udp_ensure_started()`+断线重置 `udp_started`；广播改 `IPAddress(255,255,255,255)`；`wifi_init()` 立即首连（重试门只管重连）；Mahony 抽到 Arduino-free 的 `src/mahony.h`，main.cpp 复用
+- **验证（编排层亲跑，非子代理报告）**：`pio run` **0 Error 0 Warning**（RAM 13.9% / Flash 57.7%）；真实 parity 测试用 `clang++` 编译 `mahony.h` 对比 `imu_filter.py`，**max diff 2.40e-05°**（<1e-3）
+- 契约核对：JSON `{"p","r","y"}` 逐行 + `\n`（桥按行拆包）、**20Hz 发送**（桥对 udp/serial 不抽帧，速率由手套端控制）、`BAUDRATE=115200`、端口 `8766` 均与 `pc/config.py` 一致
+
+### 待办（全部卡硬件）
+- 真机：MPU6050 实读校验（WHO_AM_I=0x68）→ 有线串口联调（`--glove-source serial:COMx`）→ WiFi UDP 广播联调 → 欧拉角轴向/零位装机标定
+
+---
+
 ## 2026-09-10（手势手套：调研→方案→仿真 7 轮验证→冻结 + GitHub 基线）
 
 ### 用户裁决
