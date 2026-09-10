@@ -19,3 +19,7 @@ desktop.ini
 pc/yolo_multiscale/
 pc/weights/
 .embai/
+
+# CodeGraph local index (regenerable)
+.codegraph/
+

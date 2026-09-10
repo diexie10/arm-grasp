@@ -1,0 +1,10 @@
+{
+  "exclude": [
+    "Drivers/",
+    "Middlewares/",
+    "MDK-ARM/",
+    "pc/models/",
+    "pc/yolo_multiscale/",
+    "pc/weights/"
+  ]
+}
