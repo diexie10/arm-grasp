@@ -76,3 +76,21 @@
 #ifndef GLOVE_MAHONY_KI
 #define GLOVE_MAHONY_KI 0.0f
 #endif
+
+// ── Gyro-bias calibration ─────────────────────────────────────────
+// Number of IMU samples to average for bias estimation at startup.
+// 200 samples × 10 ms = 2.0 s at 100 Hz.
+#ifndef GLOVE_CAL_SAMPLES
+#define GLOVE_CAL_SAMPLES 200
+#endif
+
+// Output-suppression window after a filter reset (ms).  Gives the
+// Mahony filter time to re-converge before JSON streaming resumes.
+#ifndef GLOVE_SETTLE_MS
+#define GLOVE_SETTLE_MS 800
+#endif
+
+// Max length of a serial command line (including '\0').
+#ifndef GLOVE_CMD_LINE_MAX
+#define GLOVE_CMD_LINE_MAX 32
+#endif

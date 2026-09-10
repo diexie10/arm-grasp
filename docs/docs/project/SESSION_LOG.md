@@ -20,6 +20,8 @@
 - 修复：`udp_ensure_started()`+断线重置 `udp_started`；广播改 `IPAddress(255,255,255,255)`；`wifi_init()` 立即首连（重试门只管重连）；Mahony 抽到 Arduino-free 的 `src/mahony.h`，main.cpp 复用
 - **验证（编排层亲跑，非子代理报告）**：`pio run` **0 Error 0 Warning**（RAM 13.9% / Flash 57.7%）；真实 parity 测试用 `clang++` 编译 `mahony.h` 对比 `imu_filter.py`，**max diff 2.40e-05°**（<1e-3）
 - 契约核对：JSON `{"p","r","y"}` 逐行 + `\n`（桥按行拆包）、**20Hz 发送**（桥对 udp/serial 不抽帧，速率由手套端控制）、`BAUDRATE=115200`、端口 `8766` 均与 `pc/config.py` 一致
+- **续做（同日）——零偏校准 + 软件重零**：①开机自动陀螺零偏校准（非阻塞，`GLOVE_CAL_SAMPLES=200`≈2s；采样期间停发流→桥自然冻结）②串口命令 `CAL`/`ZERO`/`HELP`（**`ZERO` = Mahony 重置 = "软件重启姿态解算"**，等价于原"重启回归原点"但不用重连 WiFi）③状态行 `#CAL:ok,bias_dps=...,quality_dps=...`（quality=逐轴标准差，反映校准静止度；**编排层修正了 fixer 用"零偏幅值"冒充质量指标**）④校准/重零后 `GLOVE_SETTLE_MS=800` 抑制窗口等滤波器重收敛
+- 验证（编排层亲跑）：`pio run` 0E0W（RAM 13.9%/Flash 57.7%）；parity 仍 2.40e-5°；改动仅在 glove-esp32/（未碰 pc/ui）
 
 ### 待办（全部卡硬件）
 - 真机：MPU6050 实读校验（WHO_AM_I=0x68）→ 有线串口联调（`--glove-source serial:COMx`）→ WiFi UDP 广播联调 → 欧拉角轴向/零位装机标定
