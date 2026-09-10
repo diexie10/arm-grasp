@@ -247,3 +247,64 @@ LOG_FILE = "arm_grasp.log"
 # SERVO_SWITCH_RATIO = 0.25 — 旧宽度比例阈值，改用 SERVO_SWITCH_AREA_RATIO
 # SERVO_KI = 0.0 — 积分项：调研结论 D 项放大 YOLO 噪声、I 项帧级控制易 windup，删除防误用
 # SERVO_KD = 0.0 — 微分项：同上，删除防误用
+
+
+# =====================================================================
+#  手套模式 — 手势手套姿态控制仿真（§4 方案，待仿真验证）
+# =====================================================================
+
+# ===================== 采样率 =====================
+GLOVE_IMU_HZ = 100.0           # IMU 采样率 Hz（Mahony 滤波速率）
+GLOVE_SEND_HZ = 20.0           # 发送速率 Hz（映射→舵机目标流速率，对齐固件 50Hz 刷新）
+
+# ===================== 滤波 =====================
+GLOVE_MAHONY_KP = 0.5          # Mahony 比例增益（调研推荐 0.1-1.0，初值 0.5）
+GLOVE_MAHONY_KI = 0.0          # Mahony 积分增益（0=无积分，初值保守）
+
+# ===================== 映射 =====================
+GLOVE_DEADBAND_DEG = 0.5       # 死区 °（误差 ≤ 此值 → 不动，lib-1 §4 推荐）
+GLOVE_STEP_MAX_DEG = 1.0       # 每拍最大增量 °（仿真调参值，装机联调再标定；2026-09 四轮：(α,step)=(0.2,1.0)）
+GLOVE_EMA_ALPHA = 0.2          # EMA 平滑系数（仿真调参值，装机联调再标定；2026-09 四轮：抖动 std=0.2915, avg_vel=3.6°/s）
+GLOVE_NEUTRAL_DEG = 5.0        # 中性姿态容差 °（误差在此范围内视为"中性"）
+GLOVE_LINK_TIMEOUT_MS = 500.0  # 断流冻结超时 ms（AD-4f）
+
+# ===================== 方案 A：关节镜像增益 =====================
+# pitch_err → S3，roll_err → S1，yaw_err → S5（关节角偏移，相对参考位）
+GLOVE_SCH_A_PITCH_GAIN = 1.0   # pitch→S3 增益（°关节 / °误差，初值 1.0）
+GLOVE_SCH_A_ROLL_GAIN = 0.5    # roll→S1 增益（°关节 / °误差，初值 0.5）
+GLOVE_SCH_A_YAW_GAIN = 0.8     # yaw→S5 增益（°关节 / °误差，初值 0.8）
+
+# ===================== 方案 A：IK 可达参考位 =====================
+# 方案 A 基准位由 IK 可达点导出，与未标定的 JOINT_HOME 解耦（#28）；标定日重评。
+# JOINT_HOME 不满足竖直腕不变量（j4=90-122-167=-199°），IK 不可解，
+# 故方案 A 不以 JOINT_HOME 为基准，改用此参考位（IK 可保证 j4 合规）。
+GLOVE_SCH_A_REF_R = 150.0     # 参考位水平半径 mm（IK 可达域中段）
+GLOVE_SCH_A_REF_Z = 235.0     # 参考位高度 mm（IK 可达，j4≈26° 有调节余量）
+GLOVE_SCH_A_REF_S1 = 81.0     # 参考位方位角 deg（J1 限位内，IK 可解）
+
+# ===================== 方案 B：笛卡尔速度杆增益 =====================
+# pitch_err → EE 竖直速度 vz (mm/s)，roll_err → EE 水平速度 vx (mm/s)
+# yaw_err → S1 角速度 (deg/s)
+GLOVE_SCH_B_VZ_GAIN = 2.0     # pitch→vz 增益 (mm·s⁻¹·deg⁻¹，初值 2.0)
+GLOVE_SCH_B_VX_GAIN = 2.0     # roll→vx 增益 (mm·s⁻¹·deg⁻¹，初值 2.0)
+GLOVE_SCH_B_S1_GAIN = 1.5     # yaw→S1 增益 (deg·s⁻¹·deg⁻¹，初值 1.5)
+
+# ===================== 方案 B：工作域边界 =====================
+# 依据：L2+L3=233mm 最大可达半径，|L2-L3|=23mm 最小可达半径（完全折叠时）
+# HOME 位 r≈14mm（臂折回，j2=122°），故 r 下限须 ≤14mm。
+# 取圆柱坐标 (r, z)：r ∈ [-20, 200]mm（负值=EE 在 J1 轴后方，HOME 区域）
+# z ∈ [30, 250]mm（z 下限 >0 不钻桌面上限 < L1+L2+L3=305mm 留余量）
+# 注意：r 负值表示 EE 在 J1 轴后方（j2>90° 时），IK 处理可达性。
+# ⚠ 名义值，init 时自动收缩并打印生效值（四角 IK 验证，s1±30° 多角度鲁棒）。
+# 实际生效盒子约 r∈[128,156] z∈[208,236]（菱形 IK 可达域的最大内接矩形）。
+GLOVE_SCH_B_WORK_R_MIN = -20.0  # EE r 最小 mm（名义值，init 时自动收缩）
+GLOVE_SCH_B_WORK_R_MAX = 200.0  # EE r 最大 mm（名义值，init 时自动收缩）
+GLOVE_SCH_B_WORK_Z_MIN = 30.0   # EE z 最小 mm（名义值，init 时自动收缩）
+GLOVE_SCH_B_WORK_Z_MAX = 250.0  # EE z 最大 mm（名义值，init 时自动收缩）
+
+# ===================== 仿真噪声 =====================
+GLOVE_GYRO_BIAS_X_DEG_S = 0.2   # 陀螺 X 轴零偏 °/s（MPU6050 低偏模式）
+GLOVE_GYRO_BIAS_Y_DEG_S = -0.1  # 陀螺 Y 轴零偏 °/s
+GLOVE_GYRO_BIAS_Z_DEG_S = 0.1   # 陀螺 Z 轴零偏 °/s
+GLOVE_GYRO_NOISE_DEG_S = 0.05   # 陀螺白噪标准差 °/s（MPU6050 低噪声模式）
+GLOVE_ACCEL_NOISE_M_S2 = 0.02   # 加速度白噪标准差 m/s²（MPU6050 低噪声模式）
