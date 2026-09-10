@@ -268,6 +268,10 @@ GLOVE_EMA_ALPHA = 0.2          # EMA 平滑系数（仿真调参值，装机联�
 GLOVE_NEUTRAL_DEG = 5.0        # 中性姿态容差 °（误差在此范围内视为"中性"）
 GLOVE_LINK_TIMEOUT_MS = 500.0  # 断流冻结超时 ms（AD-4f）
 
+# ===================== 两阶段限位（MoveIt Servo jointLimitVelocityScalingFactor 语义） =====================
+GLOVE_LIMIT_MARGIN_DEG = 6.0   # 限位带宽度 °（关节距限位 < 此值 → 全局速度缩放；来源：MoveIt Servo 默认 0.1 rad≈5.7°）
+GLOVE_S1_WRAP_DEG = 180.0      # s1 回绕常数 °（atan2 范围 [-180,180]，超过此值 atan2 返回负值导致 J1 限位拒绝）
+
 # ===================== 方案 A：关节镜像增益 =====================
 # pitch_err → S3，roll_err → S1，yaw_err → S5（关节角偏移，相对参考位）
 GLOVE_SCH_A_PITCH_GAIN = 1.0   # pitch→S3 增益（°关节 / °误差，初值 1.0）
@@ -295,12 +299,26 @@ GLOVE_SCH_B_S1_GAIN = 1.5     # yaw→S1 增益 (deg·s⁻¹·deg⁻¹，初值 
 # 取圆柱坐标 (r, z)：r ∈ [-20, 200]mm（负值=EE 在 J1 轴后方，HOME 区域）
 # z ∈ [30, 250]mm（z 下限 >0 不钻桌面上限 < L1+L2+L3=305mm 留余量）
 # 注意：r 负值表示 EE 在 J1 轴后方（j2>90° 时），IK 处理可达性。
-# ⚠ 名义值，init 时自动收缩并打印生效值（四角 IK 验证，s1±30° 多角度鲁棒）。
-# 实际生效盒子约 r∈[128,156] z∈[208,236]（菱形 IK 可达域的最大内接矩形）。
-GLOVE_SCH_B_WORK_R_MIN = -20.0  # EE r 最小 mm（名义值，init 时自动收缩）
-GLOVE_SCH_B_WORK_R_MAX = 200.0  # EE r 最大 mm（名义值，init 时自动收缩）
-GLOVE_SCH_B_WORK_Z_MIN = 30.0   # EE z 最小 mm（名义值，init 时自动收缩）
-GLOVE_SCH_B_WORK_Z_MAX = 250.0  # EE z 最大 mm（名义值，init 时自动收缩）
+# 粗盒防飞出数量级；两阶段限位（GLOVE_LIMIT_MARGIN_DEG）在关节域做精细减速。
+GLOVE_SCH_B_WORK_R_MIN = -20.0  # EE r 最小 mm（粗钳位，防飞出数量级）
+GLOVE_SCH_B_WORK_R_MAX = 200.0  # EE r 最大 mm（粗钳位，防飞出数量级）
+GLOVE_SCH_B_WORK_Z_MIN = 30.0   # EE z 最小 mm（粗钳位，防飞出数量级）
+GLOVE_SCH_B_WORK_Z_MAX = 250.0  # EE z 最大 mm（粗钳位，防飞出数量级）
+
+# ===================== 方案 B：EE 级步长回退梯子 =====================
+# 菱形边界平滑减速：IK 失败时按比例缩小 delta 重试（借鉴 MoveIt Servo 限位思想在笛卡尔层的应用）。
+# 每个比例乘以完整 delta（相对当前 state 的 (r,z,s1)），第一个 IK 成功即采纳。
+GLOVE_B_STEP_SCALES = [1.0, 0.5, 0.25]  # 回退梯子：100% → 50% → 25%
+
+# ===================== 方案 B：workspace 盒验证（网格搜索可行矩形） =====================
+# 网格扫描 (r, z) 空间，找最大 IK 全通过矩形；积分器钳位到此盒内。
+GLOVE_B_WS_R_MIN = 60.0     # 网格扫描 r 起点 mm
+GLOVE_B_WS_R_MAX = 200.0    # 网格扫描 r 终点 mm
+GLOVE_B_WS_R_STEP = 3.0     # 网格 r 步长 mm（3mm 细网格，精确捕捉窄带边界）
+GLOVE_B_WS_Z_MIN = 50.0     # 网格扫描 z 起点 mm
+GLOVE_B_WS_Z_MAX = 250.0    # 网格扫描 z 终点 mm
+GLOVE_B_WS_Z_STEP = 3.0     # 网格 z 步长 mm
+GLOVE_B_WS_MARGIN = 1.0     # 盒边界安全余量 mm（积分器钳位到缩进盒，远离 IK 脆弱边缘）
 
 # ===================== 仿真噪声 =====================
 GLOVE_GYRO_BIAS_X_DEG_S = 0.2   # 陀螺 X 轴零偏 °/s（MPU6050 低偏模式）

@@ -29,7 +29,7 @@ import config
 import kinematics
 
 from glove.imu_filter import MahonyFilter
-from glove.mapping import scheme_a, scheme_b, scheme_b_init
+from glove.mapping import scheme_a, scheme_a_init, scheme_b, scheme_b_init
 
 
 # =====================================================================
@@ -136,9 +136,6 @@ class IMUGenerator:
         ns = self.noise_scale
 
         # --- 体轴重力（加速度计读数）---
-        # 加速度计静止时读支撑力 [0, 0, +g]（世界系 Z 向上）。
-        # 旋转到体轴：a_body = g * [−sin(pitch), sin(roll)·cos(pitch), cos(roll)·cos(pitch)]
-        # 推导：R_body_to_world 第三行 = [−sin(p), sin(r)·cos(p), cos(r)·cos(p)]
         r = math.radians(roll_deg)
         p = math.radians(pitch_deg)
 
@@ -155,10 +152,6 @@ class IMUGenerator:
         az += random.gauss(0, self._accel_noise_std * ns)
 
         # --- 体轴角速度（欧拉角运动学方程）---
-        # ω_body = E(θ) · θ̇
-        #   ωx = θ̇roll − sin(pitch) · θ̇yaw
-        #   ωy = cos(roll) · θ̇pitch + sin(roll) · cos(pitch) · θ̇yaw
-        #   ωz = −sin(roll) · θ̇pitch + cos(roll) · cos(pitch) · θ̇yaw
         gx_rad = math.radians(roll_rate_deg_s) - sp * math.radians(yaw_rate_deg_s)
         gy_rad = cr * math.radians(pitch_rate_deg_s) + sr * cp * math.radians(yaw_rate_deg_s)
         gz_rad = -sr * math.radians(pitch_rate_deg_s) + cr * cp * math.radians(yaw_rate_deg_s)
@@ -199,6 +192,7 @@ def run_pipeline(seconds, noise_scale, scheme, keyframes=None):
     # --- 初始化 ---
     mahony = MahonyFilter()
     imu_gen = IMUGenerator(noise_scale)
+    state_a = scheme_a_init() if scheme in ("a", "both") else None
     state_b = scheme_b_init() if scheme in ("b", "both") else None
 
     # EMA 状态（首拍快照初始化，见主循环 ema_snapshot 标记）
@@ -220,10 +214,14 @@ def run_pipeline(seconds, noise_scale, scheme, keyframes=None):
     # 钳位拆分
     servo_clamp_a = 0  # 方案 A：servo_limits 饱和（最终输出在限位边界）
     step_clamp_a = 0   # 方案 A：限步器触发（正常平滑信号）
-    joint_clamp_a = 0  # 方案 A：关节域钳位（j4 等越界被 clamp）
+    halt_a = 0         # 方案 A：两阶段限位硬停（阶段 2 钳位发生的关节·拍数）
     servo_clamp_b = 0
     step_clamp_b = 0
-    joint_clamp_b = 0
+    halt_b = 0
+
+    # 两阶段限位追踪
+    scale_events_a = 0  # 方案 A：scale < 1 的拍数
+    scale_events_b = 0  # 方案 B：scale < 1 的拍数
 
     # span 追踪（每轴在整个运行中的 max - min）
     span_a_min = [float('inf')] * 6
@@ -241,6 +239,9 @@ def run_pipeline(seconds, noise_scale, scheme, keyframes=None):
     ee_path_length = 0.0
     ee_max_vel = 0.0
     ee_prev = None  # None = 首拍不计增量（避免跳变污染）
+
+    # 方案 B 停滞追踪（手误差 > 中性区但 EE 单拍位移 < 0.1mm）
+    stall_ticks_b = 0
 
     # trace 数据
     trace = []
@@ -317,20 +318,17 @@ def run_pipeline(seconds, noise_scale, scheme, keyframes=None):
             dynamic_errors_b.append((abs(err_roll), abs(err_pitch), abs(err_yaw)))
 
         # 映射输入：滤波后欧拉角相对于中性姿态的误差（规格 §4 AD-4d）
-        # 中性姿态 = (0,0,0)，故输入就是滤波后欧拉角本身。
-        # 死区作用于映射输入，过滤小幅抖动，不是过滤滤波误差。
         map_pitch = _apply_deadband(pitch_est, config.GLOVE_DEADBAND_DEG)
         map_roll = _apply_deadband(roll_est, config.GLOVE_DEADBAND_DEG)
         map_yaw = _apply_deadband(yaw_est, config.GLOVE_DEADBAND_DEG)
 
         # --- 方案 A ---
         if scheme in ("a", "both"):
-            targets_a_raw, q_a, jc_a = scheme_a(map_pitch, map_roll, map_yaw)
-            joint_clamp_a += jc_a
+            targets_a_raw, q_a, sc_a, hc_a = scheme_a(map_pitch, map_roll, map_yaw, state_a)
+            halt_a += hc_a
 
             # EMA 平滑（在舵机域）
             if not ema_snapshot_a:
-                # 首拍：快照 EMA 到原始目标（跳过爬坡瞬态）
                 ema_a = list(targets_a_raw)
                 prev_a_servo = list(targets_a_raw)
                 prev_a = list(targets_a_raw)
@@ -340,7 +338,7 @@ def run_pipeline(seconds, noise_scale, scheme, keyframes=None):
                     ema_a[j] = (config.GLOVE_EMA_ALPHA * targets_a_raw[j]
                                 + (1.0 - config.GLOVE_EMA_ALPHA) * ema_a[j])
 
-            # EMA 输出钳位到舵机限位（防止 EMA 积累越界）
+            # EMA 输出钳位到舵机限位
             for j in range(6):
                 lo, hi = kinematics.servo_limits(j)
                 if ema_a[j] < lo:
@@ -349,16 +347,20 @@ def run_pipeline(seconds, noise_scale, scheme, keyframes=None):
                     ema_a[j] = hi
 
             # 限步（舵机域逐拍增量 ≤ GLOVE_STEP_MAX_DEG）
-            targets_a, sc_a = _step_limit_with_count(ema_a, prev_a_servo,
-                                                      config.GLOVE_STEP_MAX_DEG)
-            step_clamp_a += sc_a
+            targets_a, sc_a_step = _step_limit_with_count(ema_a, prev_a_servo,
+                                                          config.GLOVE_STEP_MAX_DEG)
+            step_clamp_a += sc_a_step
             prev_a_servo = list(targets_a)
 
-            # servo_limits 饱和检测：最终输出是否在限位边界
+            # servo_limits 饱和检测
             for j in range(6):
                 lo, hi = kinematics.servo_limits(j)
                 if abs(targets_a[j] - lo) < 1e-6 or abs(targets_a[j] - hi) < 1e-6:
                     servo_clamp_a += 1
+
+            # 两阶段限位 scale 追踪
+            if sc_a < 1.0 - 1e-9:
+                scale_events_a += 1
 
             # span 追踪
             for j in range(6):
@@ -381,17 +383,17 @@ def run_pipeline(seconds, noise_scale, scheme, keyframes=None):
         targets_b_raw = None
         q_b = None
         ee_pos = None
+        sc_b_val = 1.0
         if scheme in ("b", "both"):
-            targets_b_raw, q_b, ee_pos_b, jc_b = scheme_b(map_pitch, map_roll,
-                                                            map_yaw, dt_send, state_b)
-            joint_clamp_b += jc_b
+            targets_b_raw, q_b, ee_pos_b, sc_b_val, hc_b = scheme_b(
+                map_pitch, map_roll, map_yaw, dt_send, state_b)
+            halt_b += hc_b
             if q_b is not None:
                 # IK 成功 → 完整处理
                 ee_pos = ee_pos_b
 
                 # EMA 平滑
                 if not ema_snapshot_b:
-                    # 首拍：快照 EMA 到原始目标
                     ema_b = list(targets_b_raw)
                     prev_b_servo = list(targets_b_raw)
                     prev_b = list(targets_b_raw)
@@ -410,9 +412,9 @@ def run_pipeline(seconds, noise_scale, scheme, keyframes=None):
                         ema_b[j] = hi
 
                 # 限步
-                targets_b, sc_b = _step_limit_with_count(ema_b, prev_b_servo,
-                                                          config.GLOVE_STEP_MAX_DEG)
-                step_clamp_b += sc_b
+                targets_b, sc_b_step = _step_limit_with_count(ema_b, prev_b_servo,
+                                                              config.GLOVE_STEP_MAX_DEG)
+                step_clamp_b += sc_b_step
                 prev_b_servo = list(targets_b)
 
                 # servo_limits 饱和检测
@@ -420,6 +422,20 @@ def run_pipeline(seconds, noise_scale, scheme, keyframes=None):
                     lo, hi = kinematics.servo_limits(j)
                     if abs(targets_b[j] - lo) < 1e-6 or abs(targets_b[j] - hi) < 1e-6:
                         servo_clamp_b += 1
+
+                # 两阶段限位 scale 追踪
+                if sc_b_val < 1.0 - 1e-9:
+                    scale_events_b += 1
+
+                # 停滞检测：手误差 > 中性区但 EE 单拍位移 < 0.1mm
+                hand_err_mag = abs(map_pitch) + abs(map_roll) + abs(map_yaw)
+                if hand_err_mag > config.GLOVE_NEUTRAL_DEG and ee_prev is not None and ee_pos is not None:
+                    dx = ee_pos[0] - ee_prev[0]
+                    dy = ee_pos[1] - ee_prev[1]
+                    dz = ee_pos[2] - ee_prev[2]
+                    ee_step = math.sqrt(dx * dx + dy * dy + dz * dz)
+                    if ee_step < 0.1:
+                        stall_ticks_b += 1
 
                 # span 追踪
                 for j in range(6):
@@ -440,18 +456,18 @@ def run_pipeline(seconds, noise_scale, scheme, keyframes=None):
 
                 # EE 路径长度（3D）— 首拍不计（ee_prev=None）
                 if ee_prev is not None and ee_pos is not None:
-                    dx = ee_pos[0] - ee_prev[0]
-                    dy = ee_pos[1] - ee_prev[1]
-                    dz = ee_pos[2] - ee_prev[2]
-                    step_len = math.sqrt(dx * dx + dy * dy + dz * dz)
+                    ddx = ee_pos[0] - ee_prev[0]
+                    ddy = ee_pos[1] - ee_prev[1]
+                    ddz = ee_pos[2] - ee_prev[2]
+                    step_len = math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz)
                     ee_path_length += step_len
                     ee_max_vel = max(ee_max_vel, step_len / dt_send)
                 if ee_pos is not None:
                     ee_prev = list(ee_pos)
             else:
-                # IK 失败 → 保持上一拍（targets_b_raw = prev servo）
+                # IK 失败 → 保持上一拍
                 ik_fail_count_b += 1
-                targets_b = prev_b_servo  # 保持上一拍
+                targets_b = prev_b_servo
 
         # --- trace ---
         entry = {
@@ -489,10 +505,15 @@ def run_pipeline(seconds, noise_scale, scheme, keyframes=None):
     # 钳位拆分
     metrics["a_servo_clamp"] = servo_clamp_a
     metrics["a_step_clamp"] = step_clamp_a
-    metrics["a_joint_clamp"] = joint_clamp_a
+    metrics["a_halt"] = halt_a
     metrics["b_servo_clamp"] = servo_clamp_b
     metrics["b_step_clamp"] = step_clamp_b
-    metrics["b_joint_clamp"] = joint_clamp_b
+    metrics["b_halt"] = halt_b
+
+    # 两阶段限位
+    metrics["a_scale_events"] = scale_events_a
+    metrics["b_scale_events"] = scale_events_b
+    metrics["b_stall_ticks"] = stall_ticks_b
 
     # span（每轴 max - min）
     if scheme in ("a", "both"):
@@ -639,14 +660,13 @@ def print_metrics(metrics, scheme):
     if scheme in ("a", "both"):
         jit = metrics.get("a_jitter_std", 0.0)
         sc = metrics.get("a_servo_clamp", 0)
-        s2_pass = jit < 0.3 and sc <= clamp_5pct
         print("  方案 A 抖动 std: %.4f°/拍  %s" % (jit, "PASS" if jit < 0.3 else "FAIL"))
         print("  方案 A servo_clamp: %d  %s" % (sc, "PASS" if sc <= clamp_5pct else "FAIL"))
         print("  方案 A step_clamp: %d" % metrics.get("a_step_clamp", 0))
-        jc_a = metrics.get("a_joint_clamp", 0)
-        jc_pct = jc_a * 100.0 / (6 * n_send) if n_send > 0 else 0.0
-        print("  方案 A joint_clamp: %d (%.1f%%)%s" % (
-            jc_a, jc_pct, "  WARN >20%" if jc_pct > 20.0 else ""))
+        hc_a = metrics.get("a_halt", 0)
+        hc_pct_a = hc_a * 100.0 / (6 * n_send) if n_send > 0 else 0.0
+        print("  方案 A halt: %d (%.1f%%)" % (hc_a, hc_pct_a))
+        print("  方案 A scale_events: %d (scale<1 拍数)" % metrics.get("a_scale_events", 0))
         span = metrics.get("a_span", [0.0] * 6)
         print("  方案 A span: [%s]°" % ", ".join("%.2f" % v for v in span))
         print("  方案 A 响应性: max|Δ|=%.3f°, avg_vel=%.3f°/s（单轴平均）" % (
@@ -655,14 +675,14 @@ def print_metrics(metrics, scheme):
     if scheme in ("b", "both"):
         jit = metrics.get("b_jitter_std", 0.0)
         sc = metrics.get("b_servo_clamp", 0)
-        s2_pass = jit < 0.3 and sc <= clamp_5pct
         print("  方案 B 抖动 std: %.4f°/拍  %s" % (jit, "PASS" if jit < 0.3 else "FAIL"))
         print("  方案 B servo_clamp: %d  %s" % (sc, "PASS" if sc <= clamp_5pct else "FAIL"))
         print("  方案 B step_clamp: %d" % metrics.get("b_step_clamp", 0))
-        jc_b = metrics.get("b_joint_clamp", 0)
-        jc_pct_b = jc_b * 100.0 / (6 * n_send) if n_send > 0 else 0.0
-        print("  方案 B joint_clamp: %d (%.1f%%)%s" % (
-            jc_b, jc_pct_b, "  WARN >20%" if jc_pct_b > 20.0 else ""))
+        hc_b = metrics.get("b_halt", 0)
+        hc_pct_b = hc_b * 100.0 / (6 * n_send) if n_send > 0 else 0.0
+        print("  方案 B halt: %d (%.1f%%)" % (hc_b, hc_pct_b))
+        print("  方案 B scale_events: %d (scale<1 拍数)" % metrics.get("b_scale_events", 0))
+        print("  方案 B stall_ticks: %d (手误差>中性但EE位移<0.1mm)" % metrics.get("b_stall_ticks", 0))
         span = metrics.get("b_span", [0.0] * 6)
         print("  方案 B span: [%s]°" % ", ".join("%.2f" % v for v in span))
         print("  方案 B 响应性: max|Δ|=%.3f°, avg_vel=%.3f°/s（单轴平均）" % (
@@ -705,6 +725,8 @@ def main():
     print("  IMU: %.0fHz, 发送: %.0fHz, 死区: %.1f°, EMA: %.2f, 限步: %.1f°" % (
         config.GLOVE_IMU_HZ, config.GLOVE_SEND_HZ, config.GLOVE_DEADBAND_DEG,
         config.GLOVE_EMA_ALPHA, config.GLOVE_STEP_MAX_DEG))
+    print("  限位带: %.1f°, s1回绕: %.0f°" % (
+        config.GLOVE_LIMIT_MARGIN_DEG, config.GLOVE_S1_WRAP_DEG))
 
     t0 = time.time()
     metrics, trace = run_pipeline(args.seconds, args.noise_scale, args.scheme)
